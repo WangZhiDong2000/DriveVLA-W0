@@ -51,6 +51,8 @@ class WeightedSamplerTrainer(Trainer):
 class ModelArguments:
     model_name_or_path: Optional[str] = field(default="BAAI/Emu3-Gen")
     model_config_path: Optional[str] = field(default="pretrain/Emu3-Base")
+    pretrain_vlm_path: Optional[str] = field(default=None)
+    init_fresh_expert: bool = field(default=False)
 
 @dataclass
 class DataArguments:
@@ -105,17 +107,48 @@ class TrainingArguments(tf.TrainingArguments):
     action_sample_steps: int = field(default=10)
     freeze_vlm: bool = field(default=False)  # 新增：是否冻结VLM参数
 
+def _load_vlm_from_pi0_checkpoint(model, checkpoint_path):
+    """Load only VLM weights from a Pi0 checkpoint, shard by shard, to minimise peak RAM."""
+    from safetensors import safe_open
+    import glob
+    import gc
+
+    shard_files = sorted(glob.glob(osp.join(checkpoint_path, "model-*.safetensors")))
+    if not shard_files:
+        shard_files = sorted(glob.glob(osp.join(checkpoint_path, "*.safetensors")))
+
+    print(f"Loading VLM weights from {len(shard_files)} Pi0 shards in {checkpoint_path}")
+    for shard_path in shard_files:
+        with safe_open(shard_path, framework='pt', device='cpu') as f:
+            vlm_keys = [k for k in f.keys() if k.startswith("vlm.")]
+            if not vlm_keys:
+                continue
+            vlm_dict = {k[4:]: f.get_tensor(k) for k in vlm_keys}  # strip "vlm." prefix
+        model.vlm.load_state_dict(vlm_dict, strict=False)
+        print(f"  {len(vlm_dict)} VLM keys from {osp.basename(shard_path)}")
+        del vlm_dict
+        gc.collect()
+    print("VLM weights loaded from Pi0 checkpoint. Action expert remains freshly initialized.")
+
+
 def load_model(model_args, model_config, training_args):
-    # 判断是不是本来就是Emu3Pi0模型
     with open(osp.join(model_args.model_name_or_path, "config.json"), "r") as f:
         config = json.load(f)
-    if config.get("model_type") == "Emu3Pi0":
+
+    if config.get("model_type") == "Emu3Pi0" and model_args.init_fresh_expert:
+        # Load trained VLM from Pi0 checkpoint; action expert is freshly initialized.
+        model = Emu3Pi0(config=model_config, pretrain_vlm_path=None)
+        _load_vlm_from_pi0_checkpoint(model, model_args.model_name_or_path)
+        if training_args.freeze_vlm:
+            print("Freezing VLM parameters...")
+            model.freeze_vlm()
+    elif config.get("model_type") == "Emu3Pi0":
         # 直接读取这个模型
         model_config = Emu3Pi0Config.from_pretrained(os.path.join(model_args.model_name_or_path, "config.json"))
         model, loading_info = Emu3Pi0.from_pretrained(
             model_args.model_name_or_path,
             config=model_config,
-            pretrain_vlm_path="/mnt/vdb1/shuyao.shang/VLA_Emu_Huawei/logs/train_nuplan_6va_v0.2_multi_node",
+            pretrain_vlm_path=model_args.pretrain_vlm_path or model_args.model_name_or_path,
             attn_implementation="sdpa",
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
@@ -126,9 +159,7 @@ def load_model(model_args, model_config, training_args):
         print("Mismatched sizes in Emu3Pi0 model:", loading_info.get("mismatched_keys", "N/A"))
     else:
         # 初始化 Pi0 模型
-        model = Emu3Pi0(config=model_config, pretrain_vlm_path = model_args.model_name_or_path)
-
-        # 冻结VLM参数（如果指定）
+        model = Emu3Pi0(config=model_config, pretrain_vlm_path=model_args.model_name_or_path)
         if training_args.freeze_vlm:
             print("Freezing VLM parameters...")
             model.freeze_vlm()

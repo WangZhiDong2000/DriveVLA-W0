@@ -1932,25 +1932,32 @@ class Emu3Pi0(Emu3PreTrainedModel):
     """
     _tied_weights_keys = ["vlm.lm_head.weight"]
 
-    def __init__(self, config, pretrain_vlm_path):
+    def __init__(self, config, pretrain_vlm_path=None):
         super().__init__(config)
 
         # Store configs for different components
         self.vlm_config = getattr(config, 'vlm_config', config)
         self.action_config = getattr(config, 'action_config', config)
 
-        # VLM and Action Expert
-        self.vlm, loading_info = Emu3MoE.from_pretrained(
-            pretrain_vlm_path,
-            attn_implementation="sdpa",
-            torch_dtype=self.config.torch_dtype,
-            output_loading_info=True
-        )
-        print("Missing keys in loaded VLM:", loading_info["missing_keys"])
-        print("Unexpected keys in loaded VLM:", loading_info["unexpected_keys"])
-        print("Mismatched sizes in loaded VLM:", loading_info.get("mismatched_keys", "N/A"))
+        # VLM: load from checkpoint or create with random BF16 weights (for selective loading later)
+        if pretrain_vlm_path is not None:
+            self.vlm, loading_info = Emu3MoE.from_pretrained(
+                pretrain_vlm_path,
+                attn_implementation="sdpa",
+                torch_dtype=self.config.torch_dtype,
+                output_loading_info=True
+            )
+            print("Missing keys in loaded VLM:", loading_info["missing_keys"])
+            print("Unexpected keys in loaded VLM:", loading_info["unexpected_keys"])
+            print("Mismatched sizes in loaded VLM:", loading_info.get("mismatched_keys", "N/A"))
+        else:
+            prev_dtype = torch.get_default_dtype()
+            torch.set_default_dtype(getattr(config, 'torch_dtype', torch.bfloat16))
+            self.vlm = Emu3MoE(config=self.vlm_config)
+            torch.set_default_dtype(prev_dtype)
+            print("VLM initialized with random BF16 weights (to be overwritten from Pi0 checkpoint)")
 
-        # Create Action Expert - 独立的Emu3Model
+        # Create Action Expert - freshly initialized Emu3Model
         self.action_expert = Emu3Model(self.action_config)
 
         # Action specific components
@@ -2669,6 +2676,11 @@ class Emu3Pi0(Emu3PreTrainedModel):
             )
 
         return combined_mask
+
+    def freeze_vlm(self):
+        """Freeze VLM parameters; only train Action Expert and related heads."""
+        for param in self.vlm.parameters():
+            param.requires_grad = False
 
     def get_input_embeddings(self):
         return self.vlm.model.embed_tokens
