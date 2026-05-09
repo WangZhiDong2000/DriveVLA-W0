@@ -1,15 +1,18 @@
 import json
+import random
 import warnings
 warnings.filterwarnings("ignore")
 
 import os
 import os.path as osp
+import numpy as np
 import torch
 from dataclasses import dataclass, field
 from typing import Optional, List
 import pathlib
 import transformers as tf
 from datasets import Emu3SFTDataset
+from torch.utils.data.dataloader import default_collate
 import sys
 # 获取当前脚本的目录
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -86,6 +89,7 @@ class DataArguments:
     cur_frame_idx: int = field(default=3)
     action_dim: int = field(default=3)  # Action dimension for Pi0 model
     pre_action_frames: int = field(default=3)
+    normalizer_path: Optional[str] = field(default=None)
 
 @dataclass
 class TrainingArguments(tf.TrainingArguments):
@@ -195,6 +199,81 @@ def update_configs(model_config, args, fields):
     for f in fields:
         cross_update(model_config, args, f)
 
+class L1EvalCallback(tf.TrainerCallback):
+    """Compute trajectory L1 at 1s/2s/3s after each HF Trainer eval, log to WandB."""
+    # action_frames=8 at 0.5s each → 1s=idx1, 2s=idx3, 3s=idx5
+    HORIZON_INDICES = {1: 1, 2: 3, 3: 5}
+
+    def __init__(self, eval_dataset, normalizer_path,
+                 num_eval_samples=64, eval_batch_size=2, action_sample_steps=5):
+        self.eval_dataset = eval_dataset
+        self.num_eval_samples = num_eval_samples
+        self.eval_batch_size = eval_batch_size
+        self.action_sample_steps = action_sample_steps
+        self.q01 = self.q99 = None
+        if normalizer_path:
+            q01 = np.load(osp.join(normalizer_path, "libero_q01.npy"))
+            q99 = np.load(osp.join(normalizer_path, "libero_q99.npy"))
+            self.q01 = torch.tensor(q01, dtype=torch.float32)  # [3]
+            self.q99 = torch.tensor(q99, dtype=torch.float32)  # [3]
+
+    def _denorm(self, x, device):
+        """Denormalize from [-1,1] to physical units (m, m, rad)."""
+        if self.q01 is None:
+            return None
+        return (x + 1) / 2 * (self.q99.to(device) - self.q01.to(device)) + self.q01.to(device)
+
+    def on_evaluate(self, args, state, control, model, **kwargs):
+        try:
+            import wandb
+        except ImportError:
+            return
+        if wandb.run is None:
+            return
+
+        n = min(self.num_eval_samples, len(self.eval_dataset))
+        indices = list(range(len(self.eval_dataset)))
+        random.shuffle(indices)
+        indices = indices[:n]
+
+        l1_norm = {1: [], 2: [], 3: []}
+        l1_phys = {1: [], 2: [], 3: []}
+        was_training = model.training
+
+        for start in range(0, n, self.eval_batch_size):
+            batch_idx = indices[start:start + self.eval_batch_size]
+            batch = default_collate([self.eval_dataset[i] for i in batch_idx])
+            device = next(model.parameters()).device
+            input_ids      = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            pre_action     = batch["pre_action"].to(device)
+            cmd            = batch["cmd"].to(device)
+            gt_action      = batch["action"].to(device)  # [B, 8, 3]
+
+            with torch.no_grad():
+                pred = model.sample_actions(
+                    input_ids=input_ids, pre_action=pre_action, cmd=cmd,
+                    attention_mask=attention_mask,
+                    num_inference_steps=self.action_sample_steps,
+                )  # [B, 8, 3]
+
+            for horizon, idx in self.HORIZON_INDICES.items():
+                l1 = torch.abs(pred[:, idx] - gt_action[:, idx]).mean().item()
+                l1_norm[horizon].append(l1)
+                phys_pred = self._denorm(pred[:, idx], device)
+                phys_gt   = self._denorm(gt_action[:, idx], device)
+                if phys_pred is not None:
+                    l1_phys[horizon].append(torch.abs(phys_pred - phys_gt).mean().item())
+
+        if was_training:
+            model.train()
+
+        metrics = {f"eval_l1/{h}s_norm": float(np.mean(v)) for h, v in l1_norm.items()}
+        if l1_phys[1]:
+            metrics.update({f"eval_l1/{h}s_phys": float(np.mean(v)) for h, v in l1_phys.items()})
+        wandb.log(metrics)  # no explicit step: avoids out-of-order warning with HF Trainer
+
+
 def train():
     """
     Main function to train the model.
@@ -230,21 +309,33 @@ def train():
     # Initialize dataset
     train_dataset, eval_dataset = get_dataset_split(data_args, tokenizer)
 
+    # Build L1 eval callback if WandB is enabled and normalizer path is provided
+    callbacks = []
+    if data_args.normalizer_path and "wandb" in training_args.report_to:
+        callbacks.append(L1EvalCallback(
+            eval_dataset=eval_dataset,
+            normalizer_path=data_args.normalizer_path,
+            num_eval_samples=64,
+            eval_batch_size=2,
+            action_sample_steps=training_args.action_sample_steps,
+        ))
+
     if data_args.datasets_weight:
         trainer = WeightedSamplerTrainer(
             model=model,
             args=training_args,
-            train_dataset=train_dataset, 
+            train_dataset=train_dataset,
             tokenizer=tokenizer,
+            callbacks=callbacks or None,
         )
     else:
-        # Setup Trainer
         trainer = tf.Trainer(
             model=model,
             args=training_args,
             train_dataset=train_dataset,
-            eval_dataset=eval_dataset,  # ✅ 加上这个
+            eval_dataset=eval_dataset,
             tokenizer=tokenizer,
+            callbacks=callbacks or None,
         )
 
 

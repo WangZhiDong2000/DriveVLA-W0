@@ -1985,6 +1985,16 @@ class Emu3Pi0(Emu3PreTrainedModel):
         self.rf = FlowMatchingScheduler(sample_method="beta", s=1.0)
         self.tau_emb = SinusoidalPosEmb(action_hidden_size)
 
+        # Align action components dtype with VLM so sample_actions (which inits z from
+        # vlm_initial_hidden_states.dtype) doesn't hit BF16/Float32 mismatches.
+        _model_dtype = getattr(config, 'torch_dtype', None)
+        if _model_dtype is not None:
+            self.action_expert.to(_model_dtype)
+            self.state_projector.to(_model_dtype)
+            self.action_projector.to(_model_dtype)
+            self.action_decoder.to(_model_dtype)
+            self.tau_emb.to(_model_dtype)
+
         # Create shared layer modules for gradient checkpointing
         # These are now plain Python objects, not nn.Modules, to avoid registration issues.
         self.shared_layers = [
@@ -2261,8 +2271,9 @@ class Emu3Pi0(Emu3PreTrainedModel):
 
         # Initialize random noise for actions
         z = torch.randn(batch_size, _action_frames, _action_dim, device=device, dtype=vlm_initial_hidden_states.dtype)
+        _dtype = vlm_initial_hidden_states.dtype
 
-        state_input = torch.cat([pre_action.view(batch_size, -1), cmd], dim=1)
+        state_input = torch.cat([pre_action.view(batch_size, -1), cmd], dim=1).to(_dtype)
         state_token_embedding = self.state_projector(state_input).unsqueeze(1)
 
         # Time stepping according to pi0 reference
