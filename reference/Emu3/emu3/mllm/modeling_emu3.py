@@ -27,6 +27,7 @@ from typing import List, Optional, Tuple, Union
 
 import torch, json
 import os
+from pathlib import Path
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
@@ -41,7 +42,14 @@ from transformers.modeling_attn_mask_utils import (
     _prepare_4d_causal_attention_mask,
     _prepare_4d_causal_attention_mask_for_sdpa,
 )
+from dataclasses import dataclass
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast
+
+
+@dataclass
+class Emu3Pi0Output(CausalLMOutputWithPast):
+    """CausalLMOutputWithPast extended with mixture_logit for Task 2.4 anchor BCE."""
+    mixture_logit: Optional[torch.Tensor] = None
 from transformers.modeling_utils import PreTrainedModel
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS, is_torch_greater_or_equal_than_1_13
 from transformers.utils import (
@@ -1981,6 +1989,36 @@ class Emu3Pi0(Emu3PreTrainedModel):
         self.action_projector = ActionProjector(action_dim, action_hidden_size, action_frames=self.action_frames)
         self.action_decoder = FinalLayer(action_hidden_size, action_dim)
 
+        # Anchor embedding (Task 2.2). Zero-init last layer guarantees anchor_token == 0
+        # at init, so Phase 3 startup is numerically identical to the original 87.2 ckpt.
+        from models.policy_head.anchor_embedding import AnchorEmbedding
+        self.anchor_embedding = AnchorEmbedding(
+            n_waypoints=self.action_frames,
+            action_dim=action_dim,
+            action_hidden_size=action_hidden_size,
+        )
+
+        # Mixture weight head (Task 2.4): anchor_token hidden -> scalar logit.
+        # Zero-init last layer mirrors AnchorEmbedding for bit-compat startup.
+        from models.policy_head.mixture_weight_head import MixtureWeightHead
+        self.mixture_weight_head = MixtureWeightHead(action_hidden_size)
+
+        # Action normalization stats for anchored flow path (Task 2.3).
+        # Loaded once from VLA_NORM_STATS JSON into non-persistent buffers so they
+        # follow .to(device, dtype) automatically with no per-step file IO.
+        # Note: top-level key "libero" is historical naming; values are NAVSIM stats.
+        _norm_path = os.environ.get("VLA_NORM_STATS")
+        if _norm_path and Path(_norm_path).exists():
+            _norm_cfg = json.load(open(_norm_path))
+            _q01 = torch.tensor(_norm_cfg["norm_stats"]["libero"]["q01"], dtype=torch.float32)
+            _q99 = torch.tensor(_norm_cfg["norm_stats"]["libero"]["q99"], dtype=torch.float32)
+        else:
+            # Identity fallback — safe only when anchor is never passed.
+            _q01 = torch.zeros(action_dim, dtype=torch.float32)
+            _q99 = torch.ones(action_dim, dtype=torch.float32)
+        self.register_buffer("action_q01", _q01, persistent=False)
+        self.register_buffer("action_q99", _q99, persistent=False)
+
         # Flow matching scheduler
         self.rf = FlowMatchingScheduler(sample_method="beta", s=1.0)
         self.tau_emb = SinusoidalPosEmb(action_hidden_size)
@@ -1994,6 +2032,8 @@ class Emu3Pi0(Emu3PreTrainedModel):
             self.action_projector.to(_model_dtype)
             self.action_decoder.to(_model_dtype)
             self.tau_emb.to(_model_dtype)
+            self.anchor_embedding.to(_model_dtype)
+            self.mixture_weight_head.to(_model_dtype)
 
         # Create shared layer modules for gradient checkpointing
         # These are now plain Python objects, not nn.Modules, to avoid registration issues.
@@ -2024,6 +2064,8 @@ class Emu3Pi0(Emu3PreTrainedModel):
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
+            anchor: Optional[torch.Tensor] = None,  # (B, N_f, action_dim) or None
+            sigma_anchor: Optional[float] = None,   # multiplicative noise std; default 0.04
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Forward pass combining Emu3MoE (VLM) and Action Expert using pi0-style shared attention.
@@ -2068,9 +2110,24 @@ class Emu3Pi0(Emu3PreTrainedModel):
 
         vlm_seq_len = vlm_initial_hidden_states.shape[1]  # 2400
 
-        noise = torch.randn_like(action, dtype=action.dtype, device=device)
-        tau_values = self.rf.sample_t(noise.shape[0]).to(noise.dtype).to(device)
-        noisy_action = self.rf.add_noise(action, noise, tau_values)
+        tau_values = self.rf.sample_t(action.shape[0]).to(action.dtype).to(device)
+
+        if anchor is not None:
+            # Anchored flow path (Task 2.3): endpoint x1 = perturbed anchor in phys space.
+            from models.policy_head.anchored_flow_path import build_anchored_flow_path
+            noisy_action, target_velocity, _ = build_anchored_flow_path(
+                anchor=anchor,
+                tau_GT=action,
+                t=tau_values,
+                q01=self.action_q01.to(action.dtype),
+                q99=self.action_q99.to(action.dtype),
+                sigma_anchor=sigma_anchor if sigma_anchor is not None else 0.04,
+            )
+        else:
+            # Backward-compat: pure-noise FM path (87.2 PDMS ckpt behavior).
+            noise = torch.randn_like(action, dtype=action.dtype, device=device)
+            noisy_action = self.rf.add_noise(action, noise, tau_values)
+            target_velocity = noise - action
 
         action_frames_len = noisy_action.shape[1]  # 8
         tau_emb = self.tau_emb(tau_values).to(noisy_action.dtype)
@@ -2081,8 +2138,16 @@ class Emu3Pi0(Emu3PreTrainedModel):
         state_input = torch.cat([pre_action.view(batch_size, -1), cmd], dim=1)
         state_token_embedding = self.state_projector(state_input).unsqueeze(1)  # (bs, 1, h)
 
-        action_initial_hidden_states = torch.cat([state_token_embedding, action_hidden_states_no_state], dim=1)
-        action_seq_len = action_initial_hidden_states.shape[1]
+        if anchor is not None:
+            anchor_token = self.anchor_embedding(anchor).unsqueeze(1).to(state_token_embedding.dtype)  # (B, 1, h)
+            action_initial_hidden_states = torch.cat(
+                [state_token_embedding, anchor_token, action_hidden_states_no_state], dim=1
+            )
+            _decode_skip = 2
+        else:
+            action_initial_hidden_states = torch.cat([state_token_embedding, action_hidden_states_no_state], dim=1)
+            _decode_skip = 1
+        action_seq_len = action_initial_hidden_states.shape[1]  # 9 or 10, dynamically derived
 
         current_vlm_h = vlm_initial_hidden_states
         current_action_h = action_initial_hidden_states
@@ -2138,9 +2203,18 @@ class Emu3Pi0(Emu3PreTrainedModel):
         final_vlm_hidden_states_for_lm_head = self.vlm.model.norm(current_vlm_h)
         final_action_hidden_for_decode = self.action_expert.norm(current_action_h)
 
-        velo_t_pred = self.action_decoder(final_action_hidden_for_decode[:, 1:, :], tau_emb_expanded)
+        # Task 2.4: mixture weight logit per (sample, anchor) — None when anchor=None.
+        if anchor is not None:
+            # anchor_token sits at index 1 (after state_token at index 0).
+            mixture_logit = self.mixture_weight_head(
+                final_action_hidden_for_decode[:, 1, :]
+            )  # (B,)
+        else:
+            mixture_logit = None
 
-        action_loss = F.mse_loss(noise - action, velo_t_pred)
+        velo_t_pred = self.action_decoder(final_action_hidden_for_decode[:, _decode_skip:, :], tau_emb_expanded)
+
+        action_loss = F.mse_loss(target_velocity, velo_t_pred)
 
         self.action_loss_weight = 1.0
         self.vlm_loss_weight = 0.0
@@ -2209,15 +2283,16 @@ class Emu3Pi0(Emu3PreTrainedModel):
 
         # For this training-focused forward pass, past_kv, hidden_states (intermediate), and attentions are not returned.
         if not return_dict:
-            output = (logits, None, None, None)  # logits, past_kv, hidden_states, attentions
+            output = (logits, None, None, None, mixture_logit)  # logits, past_kv, hidden_states, attentions, mixture_logit
             return (total_loss,) + output if total_loss is not None else output
 
-        return CausalLMOutputWithPast(
+        return Emu3Pi0Output(
             loss=total_loss,
             logits=logits,
             past_key_values=None,  # Not computed/returned in this training path
             hidden_states=None,  # Not computed/returned in this training path
             attentions=None,  # Not computed/returned in this training path
+            mixture_logit=mixture_logit,
         )
 
     @torch.no_grad()
@@ -2232,6 +2307,7 @@ class Emu3Pi0(Emu3PreTrainedModel):
             num_inference_steps: Optional[int] = None,
             action_frames: Optional[int] = None,
             action_dim: Optional[int] = None,
+            anchor: Optional[torch.Tensor] = None,  # (B, N_f, action_dim) or None
     ) -> torch.Tensor:
         """
         Sample actions using iterative denoising with shared VLM-Action Expert attention,
@@ -2276,6 +2352,14 @@ class Emu3Pi0(Emu3PreTrainedModel):
         state_input = torch.cat([pre_action.view(batch_size, -1), cmd], dim=1).to(_dtype)
         state_token_embedding = self.state_projector(state_input).unsqueeze(1)
 
+        # Precompute anchor_token once (anchor is fixed across denoising steps)
+        if anchor is not None:
+            anchor_token = self.anchor_embedding(anchor).unsqueeze(1).to(_dtype)  # (B, 1, h)
+            _decode_skip = 2
+        else:
+            anchor_token = None
+            _decode_skip = 1
+
         # Time stepping according to pi0 reference
         dt = -1.0 / _num_inference_steps
         dt_tensor = torch.tensor(dt, dtype=vlm_initial_hidden_states.dtype, device=device)
@@ -2294,7 +2378,12 @@ class Emu3Pi0(Emu3PreTrainedModel):
             tau_emb = self.tau_emb(t_tensor).to(z.dtype)  # t_tensor should be [batch_size]
             tau_emb_expanded = tau_emb.unsqueeze(1).expand(-1, _action_frames, -1)
             action_hidden_states_no_state = self.action_projector(z, tau_emb_expanded)
-            current_action_h = torch.cat([state_token_embedding, action_hidden_states_no_state], dim=1)
+            if anchor_token is not None:
+                current_action_h = torch.cat(
+                    [state_token_embedding, anchor_token, action_hidden_states_no_state], dim=1
+                )
+            else:
+                current_action_h = torch.cat([state_token_embedding, action_hidden_states_no_state], dim=1)
 
             num_layers = len(self.vlm.model.layers)
 
@@ -2325,7 +2414,7 @@ class Emu3Pi0(Emu3PreTrainedModel):
                 )
 
             final_action_hidden_for_decode = self.action_expert.norm(current_action_h)
-            velo_t_pred = self.action_decoder(final_action_hidden_for_decode[:, 1:, :], tau_emb_expanded)
+            velo_t_pred = self.action_decoder(final_action_hidden_for_decode[:, _decode_skip:, :], tau_emb_expanded)
             # --- End of equivalent to denoise_step ---
 
             # Euler step: z_t = z_{t+dt} + dt * v(z_{t+dt}, t+dt)
@@ -2334,6 +2423,204 @@ class Emu3Pi0(Emu3PreTrainedModel):
             current_time += dt_tensor  # Update time
 
         return z
+
+    def sample_actions_stochastic(
+            self,
+            input_ids: torch.LongTensor,
+            pre_action: torch.Tensor,
+            cmd: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            inputs_embeds: Optional[torch.FloatTensor] = None,
+            num_steps: int = 10,
+            action_frames: Optional[int] = None,
+            action_dim: Optional[int] = None,
+            anchor: Optional[torch.Tensor] = None,
+            sigma_step: float = 0.04,
+            sigma_logprob_min: float = 0.10,
+            generator: Optional[torch.Generator] = None,
+            z_init: Optional[torch.Tensor] = None,
+    ) -> dict:
+        """Stochastic Euler ODE sampler for GRPO Stage 2-B training (Task 2.5).
+
+        Mirrors sample_actions but replaces the plain Euler step with
+        stochastic_euler_step: physical-space multiplicative noise, DD-v2 log_prob form.
+
+        Returns dict with keys:
+            z_traj        : (T+1, B, N_F, 3)  z[0]=initial noise, z[T]=final
+            z_mean_traj   : (T, B, N_F, 3)    deterministic Euler means per step
+            log_prob_traj : (T, B)             DD-v2 form per-step log-prob
+            eps_step_traj : (T, B, 1, 2)       clipped multiplicative noise per step
+            z_final       : (B, N_F, 3)        alias of z_traj[-1]
+
+        Caller folds K anchors into B via repeat_interleave; 'B' may be B_eff = B*K.
+        Do NOT add @torch.no_grad() — training Pass 2 needs grads via velo_pred -> z_mean.
+        """
+        from models.policy_head.stochastic_ode_sampler import stochastic_euler_step
+
+        _action_frames = action_frames if action_frames is not None else self.action_frames
+        _action_dim = action_dim if action_dim is not None else getattr(
+            self.action_config, 'action_dim', getattr(self.config, 'action_dim', 3)
+        )
+
+        batch_size = input_ids.shape[0] if input_ids is not None else inputs_embeds.shape[0]
+        device = input_ids.device if input_ids is not None else inputs_embeds.device
+
+        # --- Pre-compute once (not in inner loop) ---
+        if inputs_embeds is None:
+            vlm_initial_hidden_states = self.vlm.model.embed_tokens(input_ids)
+        else:
+            vlm_initial_hidden_states = inputs_embeds
+        _dtype = vlm_initial_hidden_states.dtype
+        vlm_seq_len = vlm_initial_hidden_states.shape[1]
+
+        state_input = torch.cat([pre_action.view(batch_size, -1), cmd], dim=1).to(_dtype)
+        state_token_embedding = self.state_projector(state_input).unsqueeze(1)
+
+        if anchor is not None:
+            anchor_token = self.anchor_embedding(anchor).unsqueeze(1).to(_dtype)
+            _decode_skip = 2
+        else:
+            anchor_token = None
+            _decode_skip = 1
+
+        z = z_init.to(device=device, dtype=_dtype) if z_init is not None else torch.randn(
+            batch_size, _action_frames, _action_dim, device=device, dtype=_dtype
+        )
+
+        dt = -1.0 / num_steps
+        dt_tensor = torch.tensor(dt, dtype=_dtype, device=device)
+        current_time = torch.tensor(1.0, dtype=_dtype, device=device)
+
+        vlm_position_ids = position_ids
+        if vlm_position_ids is None:
+            vlm_position_ids = torch.arange(
+                vlm_seq_len, device=device, dtype=torch.long
+            ).unsqueeze(0).expand(batch_size, -1)
+
+        num_layers = len(self.vlm.model.layers)
+
+        z_traj_list: list = [z]
+        z_mean_list: list = []
+        lp_list: list = []
+        eps_list: list = []
+
+        while current_time >= -dt / 2:
+            t_tensor = current_time.expand(batch_size).to(z.dtype)
+            current_vlm_h = vlm_initial_hidden_states
+
+            tau_emb = self.tau_emb(t_tensor).to(z.dtype)
+            tau_emb_expanded = tau_emb.unsqueeze(1).expand(-1, _action_frames, -1)
+            action_hidden_states_no_state = self.action_projector(z, tau_emb_expanded)
+
+            if anchor_token is not None:
+                current_action_h = torch.cat(
+                    [state_token_embedding, anchor_token, action_hidden_states_no_state], dim=1
+                )
+            else:
+                current_action_h = torch.cat(
+                    [state_token_embedding, action_hidden_states_no_state], dim=1
+                )
+
+            action_seq_len_with_state = current_action_h.shape[1]
+            combined_attn_mask = self.create_causal_style_attention_mask(
+                vlm_seq_len, action_seq_len_with_state, attention_mask,
+                input_ids, batch_size, device, current_vlm_h.dtype,
+            )
+
+            for layer_idx in range(num_layers):
+                shared_layer = self.shared_layers[layer_idx]
+                current_vlm_h, current_action_h = shared_layer(
+                    current_vlm_h, current_action_h, vlm_position_ids,
+                    combined_attn_mask, vlm_seq_len, action_seq_len_with_state, batch_size,
+                )
+
+            final_hidden = self.action_expert.norm(current_action_h)
+            velo_t_pred = self.action_decoder(final_hidden[:, _decode_skip:, :], tau_emb_expanded)
+
+            z_next, log_prob, z_mean, eps_xy = stochastic_euler_step(
+                z, velo_t_pred, dt,
+                self.action_q01, self.action_q99,
+                sigma_step=sigma_step,
+                sigma_logprob_min=sigma_logprob_min,
+                generator=generator,
+            )
+
+            z_mean_list.append(z_mean)
+            lp_list.append(log_prob)
+            eps_list.append(eps_xy)
+            z = z_next
+            z_traj_list.append(z)
+            current_time = current_time + dt_tensor
+
+        return {
+            "z_traj":        torch.stack(z_traj_list, dim=0),   # (T+1, B, N_F, 3)
+            "z_mean_traj":   torch.stack(z_mean_list, dim=0),   # (T, B, N_F, 3)
+            "log_prob_traj": torch.stack(lp_list, dim=0),       # (T, B)
+            "eps_step_traj": torch.stack(eps_list, dim=0),      # (T, B, 1, 2)
+            "z_final":       z,                                  # (B, N_F, 3)
+        }
+
+    @torch.no_grad()
+    def sample_actions_anchored(
+            self,
+            input_ids: torch.LongTensor,
+            pre_action: torch.Tensor,
+            cmd: torch.Tensor,
+            anchor_K: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            inputs_embeds: Optional[torch.FloatTensor] = None,
+            num_inference_steps: int = 2,
+    ) -> torch.Tensor:
+        """Inference: argmax anchor pick via mixture_weight_head, then deterministic ODE (Task 2.5).
+
+        Args:
+            anchor_K: (B, K, N_F, 3) — K candidate anchors in normalized [-1, 1] space.
+            num_inference_steps: T_infer Euler steps (default 2, per Plan_3 §6).
+
+        Returns:
+            (B, N_F, 3) final denoised action trajectory.
+        """
+        self.eval()
+        B, K = anchor_K.shape[:2]
+        device = anchor_K.device
+        _dtype = anchor_K.dtype
+
+        # 1) Fold K anchors into batch and run a probe forward to get mixture_logit (B*K,)
+        anchor_BK = anchor_K.reshape(B * K, *anchor_K.shape[2:])
+        input_ids_BK = input_ids.repeat_interleave(K, dim=0) if input_ids is not None else None
+        pre_action_BK = pre_action.repeat_interleave(K, dim=0)
+        cmd_BK = cmd.repeat_interleave(K, dim=0)
+        attn_BK = attention_mask.repeat_interleave(K, dim=0) if attention_mask is not None else None
+
+        dummy_action = torch.zeros(
+            B * K, self.action_frames, self.action_config.action_dim,
+            device=device, dtype=_dtype,
+        )
+        out = self.forward(
+            input_ids=input_ids_BK, pre_action=pre_action_BK, cmd=cmd_BK,
+            action=dummy_action, anchor=anchor_BK,
+            attention_mask=attn_BK, position_ids=position_ids,
+            inputs_embeds=None, return_dict=True,
+        )
+
+        # 2) Argmax over K anchors per sample
+        logits = out.mixture_logit.view(B, K)                              # (B, K)
+        k_pick = logits.argmax(dim=-1)                                     # (B,)
+        anchor_pick = anchor_K[torch.arange(B, device=device), k_pick]    # (B, N_F, 3)
+
+        # 3) Deterministic Euler ODE on the selected anchor (T_infer steps)
+        return self.sample_actions(
+            input_ids=input_ids,
+            pre_action=pre_action,
+            cmd=cmd,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            num_inference_steps=num_inference_steps,
+            anchor=anchor_pick,
+        )
 
     @torch.no_grad()
     def sample_actions_with_kv_cache(
@@ -2347,6 +2634,7 @@ class Emu3Pi0(Emu3PreTrainedModel):
             num_inference_steps: Optional[int] = None,
             action_frames: Optional[int] = None,
             action_dim: Optional[int] = None,
+            anchor: Optional[torch.Tensor] = None,  # (B, N_f, action_dim) or None
     ) -> torch.Tensor:
         """
         Sample actions using iterative denoising with a VLM KV-cache and action-only query.
@@ -2413,6 +2701,14 @@ class Emu3Pi0(Emu3PreTrainedModel):
         state_input = torch.cat([pre_action.view(batch_size, -1), cmd], dim=1)
         state_token_embedding = self.state_projector(state_input).unsqueeze(1)
 
+        # Precompute anchor_token once (anchor is fixed across denoising steps)
+        if anchor is not None:
+            anchor_token = self.anchor_embedding(anchor).unsqueeze(1).to(state_token_embedding.dtype)  # (B, 1, h)
+            _decode_skip = 2
+        else:
+            anchor_token = None
+            _decode_skip = 1
+
         dt = -1.0 / _num_inference_steps
         current_time = torch.tensor(1.0, dtype=z.dtype, device=device)
 
@@ -2422,7 +2718,12 @@ class Emu3Pi0(Emu3PreTrainedModel):
             tau_emb_expanded = tau_emb.unsqueeze(1).expand(-1, _action_frames, -1)
 
             action_hidden_states_no_state = self.action_projector(z, tau_emb_expanded)
-            current_action_h = torch.cat([state_token_embedding.clone(), action_hidden_states_no_state], dim=1)
+            if anchor_token is not None:
+                current_action_h = torch.cat(
+                    [state_token_embedding.clone(), anchor_token, action_hidden_states_no_state], dim=1
+                )
+            else:
+                current_action_h = torch.cat([state_token_embedding.clone(), action_hidden_states_no_state], dim=1)
             action_seq_len_with_state = current_action_h.shape[1]
 
             combined_attention_mask_4d = self.create_causal_style_attention_mask(
@@ -2445,7 +2746,7 @@ class Emu3Pi0(Emu3PreTrainedModel):
                 )
 
             final_action_hidden_for_decode = self.action_expert.norm(current_action_h)
-            velo_t_pred = self.action_decoder(final_action_hidden_for_decode[:, 1:, :], tau_emb_expanded)
+            velo_t_pred = self.action_decoder(final_action_hidden_for_decode[:, _decode_skip:, :], tau_emb_expanded)
 
             z = z + dt * velo_t_pred
             current_time += dt

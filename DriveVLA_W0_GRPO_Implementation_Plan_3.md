@@ -268,66 +268,86 @@ $$R(\tau) = \begin{cases} -1 & \text{if collision} \\ NC \cdot DAC \cdot \frac{5
   anchor_phys = denormalize(anchor, q01, q99)                 # (B, N_f, 3) meters/rad
   
   # 2) 物理空间施加 multiplicative noise（仅 x,y 通道）
-  eps_mul = randn(B, 1, 2) * sigma_anchor                     # (long, lat) 2-标量
-  eps_mul = clip(eps_mul, min=-0.5, max=0.5)                  # 防止极端值翻转方向
-  anchor_xy_noisy = anchor_phys[..., :2] * (1 + eps_mul)
-  x1_phys = cat([anchor_xy_noisy, anchor_phys[..., 2:3]], -1) # heading 不变
+  # 直接调用 Task 1.2 已交付的 apply_multiplicative_noise() 原语（返回 eps_xy 供 Task 2.6 log-π）
+  from models.policy_head.multiplicative_noise import apply_multiplicative_noise
+  x1_phys, eps_xy = apply_multiplicative_noise(anchor_phys, sigma=sigma_anchor, min_clip=0.0)
+  # ε hard-clip（防止 (1+ε) 翻号）；注意 min_clip 是 σ floor，与 ε 上下界 eps_abs_clip 不同
+  eps_xy = eps_xy.clamp(-0.5, 0.5)
+  x1_phys = cat([anchor_phys[..., :2] * (1 + eps_xy), anchor_phys[..., 2:3]], -1)  # heading 不变
   
   # 3) 重新归一化回 [-1,1] 空间
   x1 = normalize(x1_phys, q01, q99)
   
   # 4) 直线路径（归一化空间，与 expert 输入一致）
+  # x1 对应原 pure-noise 路径的 `noise = randn_like(action)`（t=1 端点，先验）
   x_t    = (1 - t) * tau_GT + t * x1
-  target = x1 - tau_GT       # 与 (noise - data) 同向，复用现有 MSE 写法
+  target = x1 - tau_GT       # 与 (noise - action) 同向，复用现有 MSE 写法
   ```
-  - **t=0 → x_t = τ_GT；t=1 → x_t = x1**（与 [noise_schedulers.py](models/policy_head/noise_schedulers.py) 一致）。
-  - `q01/q99` 来自 `configs/normalizer_navsim_trainval/norm_stats.json`（mean/std/q01/q99 都已加载到内存常量，避免每步 file IO）。
+  - **t=0 → x_t = τ_GT（数据）；t=1 → x_t = x1（anchor 邻域先验）**（与 [noise_schedulers.py](models/policy_head/noise_schedulers.py) 约定一致）。`x1` 替换了原 pure-noise 路径里 `noise = randn_like(action)` 的角色。
+  - `q01/q99` 从 `configs/normalizer_navsim_trainval/norm_stats.json` 一次性加载到 `Emu3Pi0` 的 non-persistent buffer（`action_q01`/`action_q99`），避免每步 file IO，随 `.to(device, dtype)` 自动迁移。**注意：该 JSON 的顶层 data key 是 `"libero"`（历史命名遗留，数值实际是 NAVSIM 量纲）**，读取方式 `norm_cfg["norm_stats"]["libero"]`，与所有 inference 脚本一致，不重命名。
+  - Task 2.3 **仅改 `Emu3Pi0.forward`**；`sample_actions` / `sample_actions_with_kv_cache` 的 anchor 初始化由 Task 2.5 stochastic ODE sampler 统一接管。
   - 同样的 denorm-perturb-renorm 模式也用于 Stage 2-B 每步采样器的 ε_step（Task 2.5）。
 - **Verification**：
   - σ_anchor=0 时 `x_t = (1-t)·τ_GT + t·anchor_renorm`，与原始（无噪声）插值差距 < 1e-5；
   - t=0 时 `||x_t − τ_GT|| < 1e-6`；t=1 时 `||x_t − x1|| < 1e-6`；
   - heading 通道在 t=1 时严格等于 anchor 的 heading（即归一化空间也不变）；
-  - Lateral 通道：σ_anchor=0.04，anchor lateral 物理值 0.05m → 加 ε_mul=0.04 后 → 物理 0.052m → 归一化变化量级 ~0.01（不再为 ~0）。
-- **Pass criteria**：4 项 unit test 全过。
+  - Lateral 通道：σ_anchor=0.04，anchor lateral 物理值 0.05m → 加 ε_mul=0.04 后 → 物理 0.052m → 归一化变化量级 ~0.01（不再为 ~0）；
+  - 梯度流：x_t / target 对 tau_GT 可微（backward 无 NaN/Inf）。
+- **Pass criteria**：5 项 unit test 全过。
 
 #### Task 2.4 — Mixture Weight Head
-- **Action**：`models/policy_head/mixture_weight_head.py`：MLP，输入 = 该 anchor 对应的 expert 末层池化特征（取 anchor_token 那一位的 hidden state），输出标量 logit。
-- **Verification**：每个 anchor 独立 forward，logit shape 正确；softmax 后 sum=1；gradient flow 通过。
-- **Pass criteria**：unit test 通过。
+- **Action**：`models/policy_head/mixture_weight_head.py`：MLP（`Linear(h→h)→SiLU→Linear(h→1)`，零初始化最后一层），输入直接取 `final_action_hidden_for_decode[:, 1, :]`（anchor_token 那一位的单 token 隐状态，**无需额外池化**），输出 `(B,)` 标量 logit。零初始化保证 step 0 sigmoid=0.5（与 AnchorEmbedding 联合实现 87.2 ckpt bit-compat 起步）。
+  - **调用位置**：在 `Emu3Pi0.forward` 中 `final_action_hidden_for_decode` 计算之后；`anchor=None` 走旁路（返回 `mixture_logit=None`）。返回经新 dataclass `Emu3Pi0Output(CausalLMOutputWithPast)` 的 `mixture_logit` 字段流出。BCE Loss 组装在 Task 3.3 trainer 外完成。
+  - **多 anchor batching**：训练时 anchor 维度 N_anchor 由调用方 `repeat_interleave(N_anchor, dim=0)` 折入 batch；head 输出 `(B*N_anchor,)`，Trainer 外部 reshape 回 `(B, N_anchor)` 再算 BCE。Emu3Pi0 不感知 N_anchor。
+  - ⚠️ **v2.2 修订**：`sample_actions` / `sample_actions_with_kv_cache` 在 Task 2.4 **不改**；推理路径下 anchor pick 由 Task 2.5 stochastic ODE sampler 统一接管。
+- **Verification**：每个 anchor 独立 forward，logit shape `(B,)` 正确；`sigmoid(logit) ∈ (0, 1)`（不是 softmax：loss 是逐 anchor 独立 sigmoid + BCE，见 §1.1）；不同输入产生不同 logit（非零初始化后）；gradient flow 通过。
+- **Pass criteria**：5 项 unit test 全过（shape / 零初始化 / sigmoid 范围 / 输入差异化 / 梯度流）。
 
 #### Task 2.5 — Stochastic ODE Sampler（multiplicative，物理空间噪声）
 - **决策**：v2.2 锁定 multiplicative 噪声（DD-v2 paper §3.1，反对 additive）；与 Task 2.3 同样在物理空间施加。
+- **模块结构**：单步数学（`stochastic_euler_step`）放 `models/policy_head/stochastic_ode_sampler.py`（纯函数，isolation-testable）；多步循环放 `Emu3Pi0.sample_actions_stochastic` 方法，复用 `sample_actions` 的 forward chain。
 - **Action**：实现两套 sampler：
   - **训练采样器**（T_trunc=10 步，stochastic，归一化空间走 ODE，物理空间加噪声）：
     ```
     # Euler step in normalized space
-    z_{t-Δt}^mean_norm = z_t_norm - Δt · v_φ(z_t_norm, t, anchor_token, vlm_h)
-    
+    z_{t-Δt}^mean_norm = z_t_norm + dt · v_φ(z_t_norm, t, anchor_token, vlm_h)
+    # (dt = -1/T_trunc < 0)
+
     # denorm → multiplicative perturbation → renorm
-    z_phys           = denormalize(z_{t-Δt}^mean_norm)
-    eps_step         ∼ N(0, σ_step^2 I_2),  clip |·| ≤ 0.5,  min std 0.04
-    z_phys[..., :2] *= (1 + eps_step)              # 仅 (x,y) 通道
-    z_{t-Δt}_norm    = normalize(z_phys)
+    # q01/q99 来自 Emu3Pi0.action_q01 / action_q99 (已注册 buffer，同 Task 2.3)
+    z_mean_phys      = denormalize(z_{t-Δt}^mean_norm, q01, q99)
+    eps_xy           ∼ N(0, σ_step^2 I_2),  clip |·| ≤ 0.5,  σ_eff = max(σ_step, 0.04)
+    z_next_phys      = cat([z_mean_phys[..., :2] * (1+eps_xy), z_mean_phys[..., 2:3]], -1)
+                        # 仅 (x,y) 乘性噪声；heading 不变
+    z_{t-Δt}_norm    = normalize(z_next_phys, q01, q99)
     ```
-    采样器同时返回 `(z_{t-Δt}_norm, log_prob, z_{t-Δt}^mean_norm, eps_step)`。
-  - **推理采样器**（T_infer=2 步，deterministic）：
-    ```
-    z_{t-Δt} = z_t - Δt · v_φ(z_t, t, ...)
-    ```
-    无噪声，无 denorm-renorm 往返。
+    采样器同时返回 `(z_{t-Δt}_norm, log_prob, z_{t-Δt}^mean_norm, eps_xy)`。
+    多步 dict 键：`z_traj (T+1,B,N_F,3)`、`z_mean_traj (T,B,N_F,3)`、`log_prob_traj (T,B)`、`eps_step_traj (T,B,1,2)`。
+  - **推理采样器**（T_infer=2 步，deterministic）：复用 `Emu3Pi0.sample_actions`，无需改动。
+    推理路径入口为 `Emu3Pi0.sample_actions_anchored(anchor_K, ...)`：
+    1. 探针 forward：把 K anchor `repeat_interleave(K, dim=0)` 折入 batch，调 `forward(anchor=anchor_BK, action=zeros, ...)` 拿 `mixture_logit (B*K,)` → view `(B, K)` → argmax → `anchor_pick (B, N_F, 3)`。
+    2. 跑 `sample_actions(anchor=anchor_pick, num_inference_steps=T_infer=2)`。
+    （Top-K / 加权平均留 Phase 4 优化。）
 - **Verification**：
-  - (i) deterministic 多次跑结果一致；
-  - (ii) stochastic 多次跑均值收敛到 deterministic（蒙特卡洛 50 次）；
-  - (iii) σ_step=0 时退化成 deterministic；
-  - (iv) `eps_step` 形状 `(B, K, T, 2)`，clip 上界 0.5 被保护。
-- **Pass criteria**：4 项性质通过。
+  - (i) 确定性重复：同 seed 多次跑 `stochastic_euler_step` 结果 bit-identical；
+  - (ii) 蒙特卡洛收敛：50 次随机 seed 的 z_next 均值 ≈ z_mean（max diff < 1e-1）；
+  - (iii) eps_xy shape `(B_eff, 1, 2)`（B_eff 含 K folded-in）；T 步堆叠后 reshape 回 `(B, K, T, 2)`；clip 上界 0.5 由 `apply_multiplicative_noise` + 显式 clamp 双重保护；
+  - (iv) heading 通道不变：`z_next[..., 2] == z_mean[..., 2]`（atol 1e-5）。
+- **Pass criteria**：7 项 unit test 全过（isolation，`tests/test_stochastic_ode_sampler.py`）。
 
 #### Task 2.6 — Log Policy（multiplicative 对应）
-- **Action**：log π 写在 `eps_step` 上而不是 z 上：
-  $$\log \pi_\theta(\epsilon_{step}^{(t)}) = -\frac{1}{2\sigma_{step}^2}\|\epsilon_{step}^{(t)}\|^2 + C,\quad \sigma_{step} \geq 0.10$$
-  从 sampler 同时返回 `(z_{t-Δt}, log_prob, z^mean_{t-Δt})`，与 DD-v2 `DDIMScheduler_with_logprob` 接口一致。
-- **Verification**：100 batches 无 NaN/inf；不同 σ_step 下 log π 数值幅度合理（与 DD-v2 量级 ±2 个数量级内）。
-- **Pass criteria**：unit test + 100-step smoke 训练 grad norm < 1.0。
+- **v2.2 修订**：log π 写在 **z 上**（DD-v2 z 形式），而非 eps_step 上（eps 形式梯度恒零）：
+  $$\log \pi_\theta(z_{next} | s, t) = \sum_{wp,\, c \in \{x,y\}} \left[ -\frac{(z_{next}^{\text{det}} - z_{mean})^2}{2\sigma_{lp}^2} - \log\sigma_{lp} - \tfrac{1}{2}\log 2\pi \right]$$
+  其中 $z_{next}^{\text{det}} = z_{next}.\text{detach()}$（REINFORCE 梯度仅通过 $z_{mean}(\theta)$ 反传），$\sigma_{lp} = \max(\sigma_{step}, 0.10)$，仅 (x,y) 通道（N_F×2 = 16 维）求和。与 DD-v2 `DDIMScheduler_with_logprob` lines 668-676 数值等价（论文已验证 91.2 PDMS）。此 log-density 逻辑提取为 `_gaussian_log_prob_z` helper，由 rollout 与 Pass-2 recompute 共用，保证 IS ratio 数值 bit-identical。$\sigma_{lp}$ 下限 0.10 与 R6 (Task 5.5) 数值稳定要求同源，由 helper 统一 enforce，trainer 不需手动 clamp。
+  - **rollout-pass**：`stochastic_euler_step` 内嵌调用 helper，同时返回 `log_prob`（复用 `test_stochastic_ode_sampler.py::test_log_prob_finite_100_batches` + `test_grad_flow_through_z_mean`）。
+  - **Pass-2 recompute**：`recompute_log_prob(z_t_norm, velo_pred, z_next_phys_stored, dt, q01, q99, σ_step, σ_lp_min)` 纯函数，供 Task 4.3 GRPO trainer 在 stored z_next + 当前 θ 的 fresh velo_pred 上重算 log_prob，使 IS ratio `exp(lp_new - lp_old.detach())` 在 θ 更新后携带非零梯度。Emu3Pi0 多步循环 wrapper 留给 Task 4.3 编排。
+- **Verification**：
+  - (i) on-policy bit-identity：`recompute_log_prob(stored)` 与 rollout log_prob bit-identical (atol 1e-6)；
+  - (ii) grad 仅经 velo_pred 反传，z_next_phys_stored.grad 为 None/zero；
+  - (iii) IS ratio 在 θ 未变时 ≈ 1.0 (atol 1e-5)；
+  - (iv) velo_pred 偏移 → log_prob 单调下降（Gaussian 密度惩罚）；
+  - (v) σ_step=0 时 σ_lp 下限 0.10 仍生效（与 σ_step=0.10 结果 bit-identical）。
+- **Pass criteria**：5 项新 unit test 全过（`tests/test_log_policy_recompute.py`）+ 复用 test_stochastic_ode_sampler.py test 6/7；全套 70 tests passed。
 
 ---
 
@@ -433,7 +453,7 @@ $$R(\tau) = \begin{cases} -1 & \text{if collision} \\ NC \cdot DAC \cdot \frac{5
 - **Pass criteria**：navtrain-navtest gap < 3 PDMS。
 
 #### Task 5.5 — Risk R6: log-likelihood 数值不稳
-- **Action**：log π 的 σ 下限 ≥ 0.10（写在 ε_step 上的 Gaussian 标准差，见 §Task 2.6）；ε_step 采样 std 下限 ≥ 0.04 + clip |·| ≤ 0.5；grad clip 1.0；bf16 训练。
+- **Action**：log π 的 σ 下限 ≥ 0.10（见 §Task 2.6 `_gaussian_log_prob_z` helper，rollout 与 recompute 路径共同 enforce，trainer 不需手动 clamp）；ε_step 采样 std 下限 ≥ 0.04 + clip |·| ≤ 0.5；grad clip 1.0；bf16 训练。
 - **Pass criteria**：训练日志无 inf/nan；前 100 steps grad norm < 1.0。
 
 #### Task 5.6 — Risk R9: Anchor 结构冷启动退化
