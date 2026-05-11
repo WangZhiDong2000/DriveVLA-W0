@@ -74,7 +74,7 @@ def stochastic_euler_step(
     sigma_step: float = 0.04,
     sigma_logprob_min: float = 0.10,
     generator: torch.Generator | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Single stochastic Euler step with physical-space multiplicative noise.
 
     Args:
@@ -92,6 +92,11 @@ def stochastic_euler_step(
         log_prob     : (*,)         — per-sample summed log π (DD-v2 form, x/y channels only).
         z_mean_norm  : (*, N_F, 3)  — deterministic Euler mean in normalized space.
         eps_xy       : (*, 1, 2)    — clipped multiplicative noise ε ∈ [-0.5, 0.5].
+        z_next_phys  : (*, N_F, 3)  — perturbed sample in physical space (pre-renormalize).
+                                       Required for Pass-2 bit-identical log_prob: storing
+                                       only z_next_norm and recovering via denormalize loses
+                                       ~1e-3 bf16 precision per dim, causing log_prob drift
+                                       of ~2 over 16 dims (DD-v2 (x,y) × N_F=8).
     """
     # 1) Euler mean in normalized space
     z_mean_norm = z_norm + dt * velo_pred
@@ -114,7 +119,7 @@ def stochastic_euler_step(
     sigma_lp = max(float(sigma_step), float(sigma_logprob_min))
     log_prob = _gaussian_log_prob_z(z_next_phys, z_mean_phys, sigma_lp)
 
-    return z_next_norm, log_prob, z_mean_norm, eps_xy
+    return z_next_norm, log_prob, z_mean_norm, eps_xy, z_next_phys
 
 
 def recompute_log_prob(

@@ -419,10 +419,27 @@ $$R(\tau) = \begin{cases} -1 & \text{if collision} \\ NC \cdot DAC \cdot \frac{5
 > 3. IL 项 = vs GT trajectory L1（DD-v2 默认），不是 vs frozen reference KL
 > 4. PDMS 阈值改为相对 B0
 
-#### Task 4.1 — Rollout 集成
-- **Action**：把 Phase 1 的 `rollout_collector.py` 接入训练循环。
-- **Verification**：单 batch 4 scenes，rollout 时间 < 5s。
-- **Pass criteria**：throughput 满足要求。
+#### Task 4.1 — Rollout 集成（v2.3 已完成）
+
+> **v2.3 实施修订**（相对原草稿）：
+> 1. **`rollout_collector.py` 重写**：删除内部 denoise 循环与 `_logp_gauss`（ε-form, σ=0.04）；改为薄 wrapper 直接调 `Emu3Pi0.sample_actions_stochastic`，log_prob 由 `_gaussian_log_prob_z`（z-form, σ_lp_min=0.10）统一提供，满足 Pass-1/Pass-2 bit-identical 约束（§Task 2.6/5.5）。
+> 2. **`RolloutBatch` 字段扩展**：新增 `z_t_per_step (B, K, T, N_F, 3)` 与 `z_next_phys_per_step (B, K, T, N_F, 3)` 以驱动 Task 4.3 的 `recompute_log_prob`。
+> 3. **Anchor-chunk**：K=N_anchor×G 按 `anchor_chunk=20` 分批，避免 B·K VLM prefill OOM。
+> 4. **`MockPDMRewardWrapper`**：本机无 metric_cache，新建 `utils/rl_modules/mock_pdm_reward.py`，接口与 `PDMRewardWrapper.score` 完全一致。
+> 5. **Dataset `token` 透传**：`Emu3DrivingVAVADataset.__getitem__` 增加 `sample["scene_token"] = scene["token"]`；trainer 用自定义 `_collate_with_token` 处理 str 字段。
+> 6. **`utils/train_grpo_stage2b.py`**：新建 Stage 2-B 骨架；`compute_loss` 返回 zero-loss 并打 rollout 诊断日志（reward_mean/adv_std/logp_old）；λ_a=1、σ_anchor=0.04 固定（无 warmup）。
+> 7. **Verification 改为本地可执行**：`smoke_test=True` 验证形状 + no-NaN + advantages.std>0 + recompute_log_prob finite；throughput < 5s 验证留服务器端。
+
+- **Action（已交付文件）**：
+  - `utils/rl_modules/rollout_collector.py` — 重写
+  - `utils/rl_modules/mock_pdm_reward.py` — 新建
+  - `utils/rl_modules/__init__.py` — 补 re-export
+  - `utils/datasets.py` — 增 `scene_token` 字段
+  - `utils/train_grpo_stage2b.py` — 新建（Pass-2 骨架）
+  - `scripts/scripts_train/train_grpo_stage2b_mini.sh` — 新建（本机 4-step smoke）
+  - `scripts/scripts_train/train_grpo_stage2b_full.sh` — 新建（服务器占位，含 TODO）
+- **Verification**：`bash scripts/scripts_train/train_grpo_stage2b_mini.sh` smoke_test 通过（形状 + finite + adv_std>0）；4-step 训练 loss=0、诊断日志正常。
+- **Pass criteria**：smoke 通过 + `compute_loss` 每 step 均打出 `rollout/reward_mean ∈ (0,1)`、`rollout/adv_std > 0`；vlm hash 一致。
 
 #### Task 4.2 — 异步并行 Scorer
 - **Action**：multiprocessing pool（16 workers）异步评估 PDM。

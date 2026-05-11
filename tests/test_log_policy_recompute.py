@@ -32,7 +32,7 @@ def _rollout(seed):
     z = torch.empty(B, N_F, 3).uniform_(-0.5, 0.5, generator=g_in)
     v = torch.empty(B, N_F, 3).uniform_(-0.5, 0.5, generator=g_in)
     g_s = torch.Generator().manual_seed(seed + 1000)
-    z_next_norm, lp, z_mean_norm, _ = stochastic_euler_step(
+    z_next_norm, lp, z_mean_norm, _, _ = stochastic_euler_step(
         z, v, DT, Q01, Q99, generator=g_s,
     )
     z_next_phys = denormalize(z_next_norm, Q01, Q99)

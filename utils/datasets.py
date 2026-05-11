@@ -802,6 +802,10 @@ class Emu3DrivingVAVADataset(Emu3SFTDataset):
         # "pre_action": torch.tensor(np.array(action[0:self.cur_idx]), dtype=torch.float),
         # "cmd": self.prompt2vec[prompt],
 
+        # scene_token: 16-char hex string from pkl; kept as Python str so that
+        # the trainer can build metric_cache_path without GPU transfer.
+        sample["scene_token"] = scene["token"]
+
         return sample
 
 

@@ -2505,6 +2505,7 @@ class Emu3Pi0(Emu3PreTrainedModel):
         z_mean_list: list = []
         lp_list: list = []
         eps_list: list = []
+        z_next_phys_list: list = []   # store pre-renormalize z_next_phys for bit-identical Pass-2
 
         while current_time >= -dt / 2:
             t_tensor = current_time.expand(batch_size).to(z.dtype)
@@ -2539,7 +2540,7 @@ class Emu3Pi0(Emu3PreTrainedModel):
             final_hidden = self.action_expert.norm(current_action_h)
             velo_t_pred = self.action_decoder(final_hidden[:, _decode_skip:, :], tau_emb_expanded)
 
-            z_next, log_prob, z_mean, eps_xy = stochastic_euler_step(
+            z_next, log_prob, z_mean, eps_xy, z_next_phys = stochastic_euler_step(
                 z, velo_t_pred, dt,
                 self.action_q01, self.action_q99,
                 sigma_step=sigma_step,
@@ -2550,17 +2551,118 @@ class Emu3Pi0(Emu3PreTrainedModel):
             z_mean_list.append(z_mean)
             lp_list.append(log_prob)
             eps_list.append(eps_xy)
+            z_next_phys_list.append(z_next_phys)
             z = z_next
             z_traj_list.append(z)
             current_time = current_time + dt_tensor
 
         return {
-            "z_traj":        torch.stack(z_traj_list, dim=0),   # (T+1, B, N_F, 3)
-            "z_mean_traj":   torch.stack(z_mean_list, dim=0),   # (T, B, N_F, 3)
-            "log_prob_traj": torch.stack(lp_list, dim=0),       # (T, B)
-            "eps_step_traj": torch.stack(eps_list, dim=0),      # (T, B, 1, 2)
-            "z_final":       z,                                  # (B, N_F, 3)
+            "z_traj":           torch.stack(z_traj_list, dim=0),       # (T+1, B, N_F, 3)
+            "z_mean_traj":      torch.stack(z_mean_list, dim=0),       # (T, B, N_F, 3)
+            "log_prob_traj":    torch.stack(lp_list, dim=0),           # (T, B)
+            "eps_step_traj":    torch.stack(eps_list, dim=0),          # (T, B, 1, 2)
+            "z_next_phys_traj": torch.stack(z_next_phys_list, dim=0),  # (T, B, N_F, 3)
+            "z_final":          z,                                      # (B, N_F, 3)
         }
+
+    def predict_velocity_for_grpo(
+            self,
+            input_ids:      torch.LongTensor,
+            pre_action:     torch.Tensor,
+            cmd:            torch.Tensor,
+            z_t:            torch.Tensor,
+            t_value:        float,
+            anchor:         torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            action_frames:  Optional[int] = None,
+            action_dim:     Optional[int] = None,
+    ) -> torch.Tensor:
+        """Single-step velocity prediction for GRPO Pass-2 (Task 4.3).
+
+        Replicates one iteration of the sample_actions_stochastic inner loop but
+        does NOT perform the stochastic Euler step. Returns velo_pred with gradient
+        so that recompute_log_prob → IS-ratio loss can backprop through model params.
+
+        Args:
+            input_ids:   (B_eff, L_vlm) — VLM token ids (B_eff = B*K_chunk).
+            pre_action:  (B_eff, ...) previous action context.
+            cmd:         (B_eff, cmd_dim) driving command embedding.
+            z_t:         (B_eff, N_F, 3) stored z_t in normalized [-1,1] space.
+            t_value:     ODE time for this step (matches Pass-1: 1.0 + t_idx * dt).
+            anchor:      (B_eff, N_F, 3) anchor in normalized space.
+            attention_mask: (B_eff, L_vlm) optional attention mask.
+            action_frames: override model default if set.
+            action_dim:    override model default if set.
+
+        Returns:
+            velo_pred : (B_eff, N_F, 3) — velocity prediction, gradient-enabled.
+        """
+        _action_frames = action_frames if action_frames is not None else self.action_frames
+        _action_dim = action_dim if action_dim is not None else getattr(
+            self.action_config, 'action_dim', getattr(self.config, 'action_dim', 3)
+        )
+
+        # NOTE: do NOT trim padding tokens from input_ids/attention_mask here.
+        # sample_actions_stochastic (Pass-1) uses the untrimmed sequence; trimming
+        # in Pass-2 introduces bf16 numerical drift in the VLM forward that breaks
+        # the bit-identical IS-ratio guarantee (ratio = 1 at θ_pass1 = θ_pass2).
+        batch_size = input_ids.shape[0]
+        device = input_ids.device
+
+        vlm_initial_hidden_states = self.vlm.model.embed_tokens(input_ids)
+        _dtype = vlm_initial_hidden_states.dtype
+        vlm_seq_len = vlm_initial_hidden_states.shape[1]
+
+        state_input = torch.cat([pre_action.view(batch_size, -1), cmd], dim=1).to(_dtype)
+        state_token_embedding = self.state_projector(state_input).unsqueeze(1)
+
+        anchor_token = self.anchor_embedding(anchor.to(_dtype)).unsqueeze(1).to(_dtype)
+        _decode_skip = 2
+
+        z = z_t.to(device=device, dtype=_dtype)
+
+        vlm_position_ids = torch.arange(
+            vlm_seq_len, device=device, dtype=torch.long
+        ).unsqueeze(0).expand(batch_size, -1)
+
+        t_tensor = torch.full((batch_size,), t_value, dtype=_dtype, device=device)
+        tau_emb = self.tau_emb(t_tensor).to(_dtype)
+        tau_emb_expanded = tau_emb.unsqueeze(1).expand(-1, _action_frames, -1)
+
+        action_hidden_states_no_state = self.action_projector(z, tau_emb_expanded)
+        current_action_h = torch.cat(
+            [state_token_embedding, anchor_token, action_hidden_states_no_state], dim=1
+        )
+
+        action_seq_len_with_state = current_action_h.shape[1]
+        combined_attn_mask = self.create_causal_style_attention_mask(
+            vlm_seq_len, action_seq_len_with_state, attention_mask,
+            input_ids, batch_size, device, vlm_initial_hidden_states.dtype,
+        )
+
+        current_vlm_h = vlm_initial_hidden_states
+        num_layers = len(self.vlm.model.layers)
+
+        # Mirror the gradient_checkpointing pattern used in sample_actions_stochastic
+        # (lines 2180-2192): recompute each shared_layer on backward instead of storing
+        # FFN intermediates (~78 MB/layer). Essential on RTX 5090 with <2 GB headroom.
+        for layer_idx in range(num_layers):
+            shared_layer = self.shared_layers[layer_idx]
+            if self.gradient_checkpointing and self.training:
+                current_vlm_h, current_action_h = self._gradient_checkpointing_func(
+                    shared_layer.__call__,
+                    current_vlm_h, current_action_h, vlm_position_ids,
+                    combined_attn_mask, vlm_seq_len, action_seq_len_with_state, batch_size,
+                )
+            else:
+                current_vlm_h, current_action_h = shared_layer(
+                    current_vlm_h, current_action_h, vlm_position_ids,
+                    combined_attn_mask, vlm_seq_len, action_seq_len_with_state, batch_size,
+                )
+
+        final_hidden = self.action_expert.norm(current_action_h)
+        velo_pred = self.action_decoder(final_hidden[:, _decode_skip:, :], tau_emb_expanded)
+        return velo_pred  # (B_eff, N_F, 3)
 
     @torch.no_grad()
     def sample_actions_anchored(
