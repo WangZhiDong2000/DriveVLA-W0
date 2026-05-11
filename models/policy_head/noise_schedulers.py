@@ -15,11 +15,12 @@ class FlowMatchingScheduler:
         self.s = s  # The threshold for timesteps
 
         if self.sample_method == "beta":
-            # Beta(1.5, 1.0) distribution
-            self.distribution = Beta(torch.tensor([1.5]), torch.tensor([1.0]))
+            # Beta(1.5, 1.0) distribution — explicit float32: Dirichlet kernel rejects bf16
+            self.distribution = Beta(torch.tensor([1.5], dtype=torch.float32),
+                                     torch.tensor([1.0], dtype=torch.float32))
         elif self.sample_method == "uniform":
-            # Uniform distribution from [0, s]
-            self.distribution = Uniform(torch.tensor([0.0]), torch.tensor([1.0]))
+            self.distribution = Uniform(torch.tensor([0.0], dtype=torch.float32),
+                                        torch.tensor([1.0], dtype=torch.float32))
 
     def sample_t(self, num_samples):
         """

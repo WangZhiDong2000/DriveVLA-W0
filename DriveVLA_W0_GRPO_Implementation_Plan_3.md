@@ -357,9 +357,29 @@ $$R(\tau) = \begin{cases} -1 & \text{if collision} \\ NC \cdot DAC \cdot \frac{5
 > 若 ckpt 是完整 navtrain 训练（PDMS ≈ 87.2 级别）→ 走"adapt 模式"，2k steps 起步；
 > 若 ckpt 是 mini 数据中间产物（PDMS 远低于 87.2）→ 走"完整 IL warm-up 模式"，4k+ steps。
 
+> **v2.3 本机 mini smoke 模式（2026-05-10 新增）**：
+> 本仓库已确认 ckpt = 完整 navtrain 训练（PDMS 87.2 级别），按"adapt 模式"推进。
+> 但开发分两步走：
+> 1. **本机 mini smoke**（先跑通流程，单 5090，navsim mini 1192 scene，`normalizer_navsim_mini`）
+> 2. **服务器 full**（流程通过后转移，按本节原计划 2k–4k steps + 全 navtest 评估）
+>
+> 本机 mini smoke 模式相对原计划的关键差异：
+> - **步数**：`max_steps=300`，warmup 30 steps，`save_steps 100`，`eval_steps 50`
+> - **anchor warmup**：λ_a 与 σ_anchor 0→1 / 0→0.04 由 500 steps 等比缩到 **50 steps**（Task 3.2）
+> - **PASS 标准**：放弃 PDMS 绝对阈值，改为**纯工程性校验**——
+>   (i) forward+backward 无 NaN；
+>   (ii) trainable 参数计数符合预期；
+>   (iii) `vlm.*` 训练前后 hash 不变；
+>   (iv) loss 前 ~100 steps 单调下降趋势；
+>   (v) anchor warmup 期间 loss 不爆。
+> - **mini B0 跳过**：本机 navtest 评估方差过大，mini PDMS 不作 gating 信号；保留服务器 full 评估为唯一权威指标。
+> - **K-Means anchor cache**：复用已就绪的 `cache/anchor_centers_N20.npy`（Phase 1 Task 1.1 在全 navtrain 上算的），不在 mini 上重新 fit。
+> - **AR-WM lm_head**：本机显存吃紧，必须按 Task 5.2 在 forward 时跳过 `lm_head` 调用与 `vlm_loss` 计算（labels 传 None / wrapper 显式短路），不只是 freeze。
+> - **产物隔离**：`EXP_NAME=train_grpo_stage2a_mini`，独立 output_dir，不覆盖现 87.2 ckpt。
+
 #### Task 3.1 — 训练脚本框架
-- **Action**：新建 `utils/train_grpo_stage2a.py`（沿用 `train_pi0.py` 的 HF Trainer + dataset 框架）。**Trainable**：`action_expert.*` + `action_projector.*` + `action_decoder.*` + `tau_emb.*` + 新 `anchor_embedding.*` + `mixture_weight_head.*`。**Frozen**：`vlm.*`（含 lm_head，即 AR-WM 信号头）+ `state_projector.*` + tokenizer。
-- **Verification**：单 step forward+backward 通过；trainable param count = Task 0.2 实测值 + ~7M 新 heads；`vlm.*` 的 `.grad` 为 None。
+- **Action**：新建 `utils/train_grpo_stage2a.py`（沿用 `train_pi0.py` 的 HF Trainer + dataset 框架）+ 配套 `scripts/scripts_train/train_grpo_stage2a_mini.sh`（本机 mini smoke 入口）。**Trainable**：`action_expert.*` + `action_projector.*` + `action_decoder.*` + `tau_emb.*` + 新 `anchor_embedding.*` + `mixture_weight_head.*`。**Frozen**：`vlm.*`（含 lm_head，即 AR-WM 信号头）+ `state_projector.*` + tokenizer。**关键 flag**：`init_fresh_expert=False`（Plan §0.2 #7，必须走 `from_pretrained` 加载已训 expert，不要 fresh init）。
+- **Verification**：单 step forward+backward 通过；trainable param count = Task 0.2 实测值 + ~7M 新 heads；`vlm.*` 的 `.grad` 为 None。**v2.3 mini smoke 增项**：先实现 `--smoke_test` 模式（1 batch、1 step、不写 ckpt），通过后再启动 300-step 真训练。
 - **Pass criteria**：smoke test 通过 + 参数 hash 校验：vlm.* 训练前后不变。
 
 #### Task 3.2 — 渐进式 Anchor 引入（R9 缓解）
@@ -367,8 +387,9 @@ $$R(\tau) = \begin{cases} -1 & \text{if collision} \\ NC \cdot DAC \cdot \frac{5
   - 0 → 500 steps：$\lambda_a$ 线性 0→1（让 expert 起步沿用现 ckpt 行为）
   - 500+ steps：$\lambda_a = 1$
   - 同时 anchored path 的 σ_anchor 也做 0→0.04 线性 warmup
-- **Verification**：每 100 steps eval navtest PDMS（前 1k steps 高频）。
-- **Pass criteria**：训练全程 PDMS 不掉超过 max(2.0, B0 × 0.025)；最终回到 ≥ B0 − 1.2。
+  - **v2.3 本机 mini smoke**：warmup 步数等比缩到 50 steps（与 max_steps=300 匹配）
+- **Verification**：每 100 steps eval navtest PDMS（前 1k steps 高频）。**v2.3 mini smoke**：仅日志记录 λ_a / σ_anchor / loss 曲线，不评估 PDMS。
+- **Pass criteria**：训练全程 PDMS 不掉超过 max(2.0, B0 × 0.025)；最终回到 ≥ B0 − 1.2。**v2.3 mini smoke**：loss 曲线在 warmup 期内不爆（无 inf/nan，grad norm < 5.0）。
 
 #### Task 3.3 — IL Loss 实现（vs GT，仅正 anchor）
 - **Action**：组装
@@ -379,9 +400,9 @@ $$R(\tau) = \begin{cases} -1 & \text{if collision} \\ NC \cdot DAC \cdot \frac{5
 - **Pass criteria**：loss 收敛趋势 + mixture_weight 合成验证通过。
 
 #### Task 3.4 — 适配训练 + early-stop
-- **Action**：默认 2k steps；如果 1k 步时 PDMS 还未回到 B0 − 2.0，触发"延长模式"再加 2k；如果 4k 步仍未达到 B0 − 1.2，挂起进入 R10 兜底（Tier-1 LoRA 解冻 vlm 的 q/v_proj）。
-- **Verification**：每 500 steps eval navtest，绘制曲线 + 关键 metric（NC/DAC/EP/TTC）。
-- **Pass criteria**：`final navtest PDMS ≥ B0 − 1.2`（v2.2 把绝对 86.0 改为相对 B0 的相对值）。
+- **Action**：默认 2k steps；如果 1k 步时 PDMS 还未回到 B0 − 2.0，触发"延长模式"再加 2k；如果 4k 步仍未达到 B0 − 1.2，挂起进入 R10 兜底（Tier-1 LoRA 解冻 vlm 的 q/v_proj）。**v2.3 本机 mini smoke**：固定 `max_steps=300`，无 early-stop 分支（流程验证为目的，不追求收敛）；产物归档后转服务器跑原计划 2k 起步。
+- **Verification**：每 500 steps eval navtest，绘制曲线 + 关键 metric（NC/DAC/EP/TTC）。**v2.3 mini smoke**：跳过 navtest，仅看 loss 曲线 + grad norm + vlm hash 校验。
+- **Pass criteria**：`final navtest PDMS ≥ B0 − 1.2`（v2.2 把绝对 86.0 改为相对 B0 的相对值）。**v2.3 mini smoke**：5 项工程性校验全过（见 Phase 3 v2.3 修订段）。
 
 #### Task 3.5 — Stage 2-A ckpt 落盘（不再作 reference policy）
 - **Action**：保存最终 ckpt 作为 Stage 2-B 的初始化点。**v2.2 取消"reference policy KL 锚"用法**——DD-v2 实际代码 IL 项是 vs GT trajectory L1（[diffusiondrivev2_model_rl.py:1105](reference/DiffusionDriveV2/navsim/agents/diffusiondrivev2/diffusiondrivev2_model_rl.py#L1105)），无需第二份 frozen 副本。reference-policy KL 留给 Phase 7 ablation（Task 7.5 新增）。

@@ -53,6 +53,10 @@ class AnchorEmbedding(nn.Module):
         nn.init.zeros_(self.mlp[-1].weight)
         nn.init.zeros_(self.mlp[-1].bias)
 
-    def forward(self, anchor: torch.Tensor) -> torch.Tensor:
-        """anchor: (B, N_f, action_dim) in normalized [-1, 1] space → (B, action_hidden_size)."""
-        return self.mlp(anchor.flatten(1))
+    def forward(self, anchor: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+        """anchor: (B, N_f, action_dim) in normalized [-1, 1] space → (B, action_hidden_size).
+
+        scale: λ_a warmup coefficient (0→1 over warmup steps). At scale=0, anchor_token is
+        zeroed out, preserving the original FM forward behavior for smooth cold-start (R9).
+        """
+        return self.mlp(anchor.flatten(1)) * scale

@@ -2066,6 +2066,7 @@ class Emu3Pi0(Emu3PreTrainedModel):
             return_dict: Optional[bool] = None,
             anchor: Optional[torch.Tensor] = None,  # (B, N_f, action_dim) or None
             sigma_anchor: Optional[float] = None,   # multiplicative noise std; default 0.04
+            lambda_a: float = 1.0,                  # anchor warmup scale (0→1 over warmup steps, Task 3.2)
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Forward pass combining Emu3MoE (VLM) and Action Expert using pi0-style shared attention.
@@ -2139,7 +2140,7 @@ class Emu3Pi0(Emu3PreTrainedModel):
         state_token_embedding = self.state_projector(state_input).unsqueeze(1)  # (bs, 1, h)
 
         if anchor is not None:
-            anchor_token = self.anchor_embedding(anchor).unsqueeze(1).to(state_token_embedding.dtype)  # (B, 1, h)
+            anchor_token = self.anchor_embedding(anchor, scale=lambda_a).unsqueeze(1).to(state_token_embedding.dtype)  # (B, 1, h)
             action_initial_hidden_states = torch.cat(
                 [state_token_embedding, anchor_token, action_hidden_states_no_state], dim=1
             )
