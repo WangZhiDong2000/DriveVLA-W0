@@ -1,1 +1,0 @@
-1. data directionary add navsim： data/navsim

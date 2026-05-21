@@ -16,7 +16,7 @@ WORLD_SIZE=1
 RANK=0
 MASTER_ADDR=127.0.0.1
 MASTER_PORT=29601
-NGPUS=1
+NGPUS=8
 
 # Kill stale processes
 STALE_PIDS=$(pgrep -f "torchrun.*train_grpo_stage2b\|python.*train_grpo_stage2b" 2>/dev/null || true)
@@ -38,18 +38,17 @@ MASTER_PORT=$(find_free_port ${MASTER_PORT})
 echo "[startup] Using MASTER_PORT=${MASTER_PORT}"
 
 # ── Server paths (adjust before running) ─────────────────────────────────────
-DATAPATH='/home/wang/Dataset/navsim/download/processed_data/meta/navsim_emu_vla_256_144_trainval_pre_1s.pkl'
+DATAPATH='/data2/data/navsim/processed_data/meta/navsim_emu_vla_256_144_trainval_pre_1s.pkl'
 EXP_NAME=train_grpo_stage2b_full
 
 MODEL_NAME_OR_PATH="$(pwd)/pretrained_models/Emu3_Flow_Matching_Action_Expert_PDMS_87.2"
 MODEL_CONFIG_PATH="$(pwd)/pretrained_models/Emu3_Flow_Matching_Action_Expert_PDMS_87.2"
 # TODO: replace with Stage 2-A full ckpt once available
 INIT_CKPT_PATH="$(pwd)/logs/train_grpo_stage2a_full/checkpoint-2000"
-# TODO: replace with actual metric_cache root
-METRIC_CACHE_ROOT="/TODO/navsim/metric_cache/trainval"
+METRIC_CACHE_ROOT="/data2/data/navsim/metric_cache/trainval"
 
-export PYTHONPATH=$(pwd)
-export PATH="/home/wang/anaconda3/envs/drivevla/bin:$PATH"
+export PYTHONPATH=$(pwd):$(pwd)/inference/navsim/navsim
+export PATH="/data1/miniconda3/envs/drivevla/bin:$PATH"
 export VLA_NORM_STATS="$(pwd)/configs/normalizer_navsim_trainval/norm_stats.json"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 

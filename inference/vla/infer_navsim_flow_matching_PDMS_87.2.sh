@@ -19,23 +19,23 @@ if [ -z "$DRIVEVLA_ROOT" ]; then
 fi
 
 # 模型和配置路径
-export VLA_ACTION_TOKENIZER="${VLA_ACTION_TOKENIZER:-/mnt/vdb1/shuyao.shang/VLA_Emu_Huawei/pretrained_models/fast}"
-export VLA_VLM_MODEL="${VLA_VLM_MODEL:-/mnt/vdb1/shuyao.shang/VLA_Emu_Huawei/logs/train_nuplan_6va_v0.2_multi_node}"
-export VLA_NORM_STATS="${VLA_NORM_STATS:-/mnt/vdb1/shuyao.shang/VLA_Emu_Huawei/configs/normalizer_navsim_trainval/norm_stats.json}"
-export VLA_TOKEN_YAML="${VLA_TOKEN_YAML:-data/navsim/processed_data/scene_files/scene_filter/navtest.yaml}"
+export VLA_ACTION_TOKENIZER="${VLA_ACTION_TOKENIZER:-${DRIVEVLA_ROOT}/pretrained_models/fast}"
+export VLA_VLM_MODEL="${VLA_VLM_MODEL:-${DRIVEVLA_ROOT}/pretrained_models/Emu3-Stage1}"
+export VLA_NORM_STATS="${VLA_NORM_STATS:-${DRIVEVLA_ROOT}/configs/normalizer_navsim_trainval/norm_stats.json}"
+export VLA_TOKEN_YAML="${VLA_TOKEN_YAML:-${DRIVEVLA_ROOT}/data/navsim/processed_data/scene_files/scene_filter/navtest.yaml}"
 
 # 推理参数（可通过环境变量覆盖）
-export EMU_HUB="${EMU_HUB:-/mnt/vdb1/shuyao.shang/VLA_Emu_Huawei/logs/train_navsim_pi0_vava_from_nuplan_ft}"
-export OUTPUT_DIR="${OUTPUT_DIR:-/mnt/vdb1/shuyao.shang/VLA_Emu_Huawei/logs/train_navsim_pi0_vava_from_nuplan_ft/json_output_cursor_clean}"
-export TEST_DATA_PKL="${TEST_DATA_PKL:-/mnt/nvme0n1p1/yingyan.li/repo/VLA_Emu_Huawei/data/navsim/processed_data/meta/navsim_emu_vla_256_144_test_pre_1s.pkl}"
+export EMU_HUB="${EMU_HUB:-${DRIVEVLA_ROOT}/pretrained_models/Emu3_Flow_Matching_Action_Expert_PDMS_87.2}"
+export OUTPUT_DIR="${OUTPUT_DIR:-${DRIVEVLA_ROOT}/outputs/infer_navsim_flow_matching_PDMS_87.2}"
+export TEST_DATA_PKL="${TEST_DATA_PKL:-/data2/data/navsim/processed_data/meta/navsim_emu_vla_256_144_test_pre_1s.pkl}"
 
 # 可选参数
 export VLA_NUM_WORKERS="${VLA_NUM_WORKERS:-12}"
 export VLA_BATCH_SIZE="${VLA_BATCH_SIZE:-1}"
 
 # Anchor 相关路径（用于模型内部，可通过环境变量覆盖）
-export VLA_ANCHOR_CLUSTER_PATH="${VLA_ANCHOR_CLUSTER_PATH:-/mnt/vdb1/yingyan.li/emu_vla_logs/cluster_centers_8192.npy}"
-export VLA_ANCHOR_METRIC_SCORE_PATH="${VLA_ANCHOR_METRIC_SCORE_PATH:-/mnt/vdb1/yingyan.li/emu_vla_logs/formatted_pdm_score_8192.npy}"
+export VLA_ANCHOR_CLUSTER_PATH="${VLA_ANCHOR_CLUSTER_PATH:-${DRIVEVLA_ROOT}/reference/Emu3/cluster_centers_8192.npy}"
+# VLA_ANCHOR_METRIC_SCORE_PATH not needed for flow matching inference
 
 # ============================================================================
 # 执行推理

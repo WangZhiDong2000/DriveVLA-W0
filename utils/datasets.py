@@ -28,7 +28,7 @@ if vla_emu_path is None:
             break
     # 如果还是找不到，尝试默认路径（向后兼容）
     if vla_emu_path is None:
-        vla_emu_path = "/mnt/nvme0n1p1/yingyan.li/repo/VLA_Emu"
+        vla_emu_path = "/root/DriveVLA-W0"
 
 if vla_emu_path and os.path.exists(vla_emu_path) and vla_emu_path not in sys.path:
     sys.path.append(vla_emu_path)
@@ -86,7 +86,7 @@ class Emu3SFTDataset(Dataset):
             # 从环境变量或参数中获取 vision_hub 路径
             self.vision_hub = getattr(args, 'vision_hub', None)
             if self.vision_hub is None:
-                self.vision_hub = os.environ.get('VLA_VISION_HUB', '/mnt/nvme0n1p1/yingyan.li/repo/VLA_Emu/pretrained_models/Emu3-VisionTokenizer')
+                self.vision_hub = os.environ.get('VLA_VISION_HUB', '/root/DriveVLA-W0/pretrained_models/Emu3-VisionTokenizer')
             self.image_processor = AutoImageProcessor.from_pretrained(self.vision_hub, trust_remote_code=True)
             self.image_tokenizer = AutoModel.from_pretrained(self.vision_hub, trust_remote_code=True)
             self.image_processor.min_pixels = 80 * 80
@@ -494,7 +494,7 @@ class Emu3DrivingDataset(Emu3SFTDataset):
         for image_path in img_list[start_idx-2*(num_frames-1):start_idx + 1:2]:  
             if do_flip:
                 image_path = image_path.replace("/trainval_vq_codes/", "/trainval_vq_codes_flip/")
-            # image_path = image_path.replace("/mnt/nvme0n1p1/yingyan.li/repo/OmniSim/", "/mnt/nvme0n1p1/yingyan.li/repo/VLA_Emu/")
+            # image_path = image_path.replace("/mnt/nvme0n1p1/yingyan.li/repo/OmniSim/", "/root/DriveVLA-W0/")
             selected_frames.append(np.load(image_path))
 
         tensor_frames = [torch.from_numpy(frame) for frame in selected_frames]

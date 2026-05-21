@@ -26,6 +26,24 @@ from typing import Dict, List, Tuple
 import numpy as np
 import torch
 
+# Pre-load drivevla env's C-extension packages before any navsim/nuplan imports.
+# nuplan depends on shapely/geopandas/pandas/cv2/rasterio compiled for Python 3.9.
+# By importing drivevla's Python 3.10 versions first, sys.modules caches them and
+# nuplan reuses the correct versions. NUPLAN_SITE is appended (not prepended) to
+# sys.path so it only provides nuplan (pure Python), never overrides drivevla's packages.
+import sys as _sys
+try:
+    import shapely as _shapely      # noqa: F401
+    import geopandas as _geopandas  # noqa: F401
+    import pandas as _pandas        # noqa: F401
+    import cv2 as _cv2              # noqa: F401
+    import rasterio as _rasterio    # noqa: F401
+    _NUPLAN_SITE = "/data1/miniconda3/envs/navsim/lib/python3.9/site-packages"
+    if _NUPLAN_SITE not in _sys.path:
+        _sys.path.append(_NUPLAN_SITE)
+except ImportError:
+    pass  # Packages absent -> navsim imports below fail -> _NAVSIM_AVAILABLE=False
+
 # navsim / omegaconf / hydra are only available in the full NAVSIM environment.
 # They are imported lazily inside functions/methods so that the module can be
 # imported and mock-tested without those packages installed.

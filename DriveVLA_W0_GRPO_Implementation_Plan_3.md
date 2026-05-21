@@ -64,6 +64,98 @@ v2.1 完成后，对 `reference/Emu3/emu3/mllm/modeling_emu3.py`、`models/polic
 
 ---
 
+## 0.5 v2.5 修订说明（服务器全数据集主路径切换，2026-05-12）
+
+### 0.5.1 v2.5 修订动因
+
+v2.2 → v2.4 的开发全部在 **本机单 5090 32 GB + NAVSIM mini (51,739 samples / 1192 scenes) + MockPDMRewardWrapper** 路径完成。本机环境存在四项本质限制：
+
+1. **显存预算紧张**：单 GPU 32 GB 对 GRPO 二段式 forward（Pass-1 N_anchor=20 × G=8 rollouts + Pass-2 N_a × T 次 backward）只能跑极小配置（G=2, T=4, anchor_chunk=1），不能反映真实训练显存曲线。
+2. **无 NAVSIM metric_cache**：本机无 navsim env，只能用 MockPDMRewardWrapper（随机 reward），RL 信号是噪声——**任何"RL loss 下降 / advantage 极性 / has_positive 切换"的实证都不可信**。
+3. **Normalizer 不匹配**：mini 数据 q01/q99 与 trainval 分布偏离（mini 1192 scenes 是 trainval 子集 + 不同采样策略），用 `configs/normalizer_navsim_mini` 训练出的 expert 在 trainval/navtest 上推理会有量纲偏差。
+4. **无 navtest 评测能力**：本机不能跑 navtest pipeline，**Baseline B0 未锁定**，所有 PDMS 阈值（B0 − 1.2 / B0 + 2.0 / B0 + 3.0）至今没有具体数值。
+
+v2.5 把开发主路径切换到 **服务器（8× A100 80 GB）+ navtrain full + 真实 PDMRewardWrapper + navtest 评测**。本机 mini/mock 路径降级为 **CI 通道**（保留作代码改动的回归 smoke，不再产生 PASS criteria 信号）。
+
+### 0.5.2 状态快照（2026-05-12 v2.4 末）
+
+**A. 已交付（本机完成，迁移即用）**
+
+| 模块 | 文件 | 说明 |
+|------|------|------|
+| Phase 1 RL 算子 | `utils/rl_modules/*.py` | intra/inter advantage、PDM wrapper、rollout collector、mock scorer |
+| Phase 2 模型改造 | `models/policy_head/*.py` | anchor_embedding、anchored_flow_path、mixture_weight_head、stochastic_ode_sampler、mode_selector(骨架)、multiplicative_noise |
+| Anchor 聚类 cache | `cache/anchor_centers_N20.npy` | 在完整 navtrain (~85k scenes) 上 K-Means 得到，**与 v2.5 服务器主路径直接兼容** |
+| Stage 2-A trainer | `utils/train_grpo_stage2a.py` | trainable/frozen 分组 + anchor warmup + BCE chunked path |
+| Stage 2-B trainer | `utils/train_grpo_stage2b.py` | Pass-1 rollout + Pass-2 REINFORCE + IL loss + VLMHashCallback |
+| 单元测试 | `tests/test_*.py` | 13 个文件、约 70 tests，覆盖所有新模块 |
+
+**B. 本机做过但服务器侧必须重做（本机结果不可信）**
+
+| Task | 本机状态 | 服务器侧需要做 | 重做原因 |
+|------|---------|---------------|---------|
+| 0.1 Ckpt 解析 | 已做 | 重做 sanity check | 路径校对；多 GPU 加载侧 |
+| 0.2 组件加载 | 已做 | 重做 sanity check | DDP 模型分发路径验证 |
+| **0.3 Baseline 复现** | **未做** | **必做（Day 0 阻塞项）** | 本机无 navtest，B0 至今未知 |
+| **3.1–3.5 Stage 2-A IL 适配** | mini ckpt（500 steps） | **重新跑全数据** | mini normalizer 不兼容；服务器 ckpt 才能进 Phase 4 |
+| 4.1 Rollout 集成 | mock 4-step ✅ | **真实 PDMRewardWrapper smoke** | mock reward 随机 |
+| 4.3 GRPO Loss 集成 | 4-step mock ✅ | **1-epoch 真实数据 smoke** | reward 信号需真实，才能验证 RL gradient 方向 |
+
+**C. 服务器全新任务（本机从未做过）**
+
+- **Task 0.4（v2.5 新增）**：NAVSIM metric_cache 准备（Phase 4 前置依赖；用户确认未就绪）
+- Task 4.2：Async parallel PDM scorer 集成（首次跑真实 16-worker pool）
+- Task 4.4：1-epoch GRPO smoke + 真实 navtest 评测
+- Task 4.5：完整 10-epoch GRPO 训练
+- Phase 5 全部：8 项 risk 验证（多数依赖 navtest PDMS 评估）
+- Phase 6 全部：Mode Selector 训练 + 新 anchored inference 脚本 + pipeline 集成
+- Phase 7 全部：完整评估 + 7 项 ablation
+
+### 0.5.3 主路径切换对照（v2.4 mini ↔ v2.5 server）
+
+| 维度 | v2.4 本机 mini | **v2.5 服务器 full** |
+|-----|---------------|--------------------|
+| 数据集 | navsim mini (1192 scenes / 51,739 samples) | **navtrain full (~85k scenes / ~220k samples)** |
+| Normalizer | `configs/normalizer_navsim_mini` | **`configs/normalizer_navsim_trainval`** |
+| Scorer | MockPDMRewardWrapper（随机 reward） | **PDMRewardWrapper（16 workers，真实 PDM 评分）** |
+| Eval | 无（仅工程性校验） | **navtest 真实 PDMS（每 N 步或每 epoch）** |
+| GPU | 单 5090 32 GB | **8× A100 80 GB（DDP via torchrun）** |
+| per_device_train_batch_size | 1 | **2** |
+| gradient_accumulation_steps | 1 | **8** |
+| 有效 batch | 1 | **128 (= 2 × 8 GPU × 8 accum)** |
+| Phase 3 steps | 300 (mini smoke) | **2000 起步 + early-stop 延至 4000** |
+| Phase 4 steps | 4 (mock smoke) | **~137,500（10 epochs / eff_batch=128 / 输入 ~220k samples）** |
+| Phase 4 num_groups (G) | 2 | **8（DD-v2 默认裁剪后）** |
+| Phase 4 T_trunc | 4 | **10（DD-v2 默认）** |
+| Phase 4 anchor_chunk | 1 | **20（即 N_anchor 全装，Pass-1 prefill 一次跑完）** |
+| PASS criteria | 工程性校验 5 项 | **navtest PDMS 相对 B0 阈值（Phase 3 ≥B0−1.2，Phase 4 ≥B0+2.0）** |
+
+### 0.5.4 本机 CI 通道（保留但弱化）
+
+下列 artifact 保留作为代码改动的本机 smoke / 回归测试，**不再产生 PASS criteria 信号**：
+
+- `scripts/scripts_train/train_grpo_stage2a_mini.sh` / `train_grpo_stage2a_mini_full_bce.sh`
+- `scripts/scripts_train/train_grpo_stage2b_mini.sh`
+- `utils/rl_modules/mock_pdm_reward.py`
+- `tests/test_*.py` 全部 70 tests
+- `configs/normalizer_navsim_mini/`
+- `logs/train_grpo_stage2a_mini_full_bce/checkpoint-500/`（mini Stage 2-A 产物，**不进 Phase 4 主路径**）
+
+**使用规则**：
+1. 每次改 `models/policy_head/`、`utils/rl_modules/`、trainer 时，本机跑相关 unit test + mini smoke 验证未引入 NaN/形状错。
+2. **任何 PDMS / reward 曲线 / grad 稳定性结论必须基于服务器 v2.5 主路径的运行结果**，本机 mini/mock 数据不作支撑。
+3. 新建 PR 时把"本机 CI 通过"列为前置项，但不作为 phase 验收依据。
+
+### 0.5.5 v2.5 verification 重定义
+
+由于主路径切换，部分 task 的 Verification / Pass criteria 文字需要重读：
+
+- **Phase 3 v2.3 段落**（"v2.3 本机 mini smoke 模式 2026-05-10 新增"）：v2.5 起降级为 CI 通道描述。Phase 3 主路径 verification 回到 v2.2 原文（navtest 中途评估 + B0 相对阈值）。
+- **Task 4.1 v2.3 段落**（"v2.3 实施修订"）：保留作 mock smoke 通过的记录；v2.5 新增"真实 PDM scorer + 8 GPU rollout 通过"作为该 task 的最终 PASS criteria。
+- **Task 4.3 ✅ v2.4 完成**：v2.5 起降级为"代码完成 ✅，真实数据 smoke 待 v2.5 服务器侧验证"。Phase 4 完整训练（Task 4.4/4.5）才是 Task 4.3 信号的真实校验。
+
+---
+
 ## 1. 关键设计（v2.2 锁死）
 
 ### 1.1 Anchored Flow Matching 严格表述（**方案 A：与代码同向**）
@@ -141,10 +233,45 @@ $$R(\tau) = \begin{cases} -1 & \text{if collision} \\ NC \cdot DAC \cdot \frac{5
 - **Verification**：`model.from_pretrained` 报告 `missing_keys=[]`、`unexpected_keys=[]`（Task 0.2 阶段尚未引入新 anchor/mixture heads，所以应严格干净）；从 ckpt 加载完成后 `sum(p.numel() for p in model.action_expert.parameters())` 落在 **150–250M** 区间。
 - **Pass criteria**：加载干净 + 实测 action_expert 参数量符合预期；同时打印 `vlm.*` 与各小头参数量并写入实验日志。
 
-#### Task 0.3 — Baseline 复现
+#### Task 0.3 — Baseline 复现（**v2.5 服务器必做**）
 - **Action**：跑 navtest 推理（用既有 `inference/` pipeline），得到该 ckpt 的真实 PDMS。**目标值由 Task 0.1 的 trainer_state 决定**——如果 ckpt README 声明 87.2，复现 ± 0.5；如果是 mini 数据上的中间产物，记录实际值（可能远低于 87.2）。
+- **v2.5 备注**：本机至今未做（无 navtest pipeline 与 metric_cache），是 Day 0 阻塞项。所有后续 phase 的 PDMS 阈值都依赖 B0，B0 未锁定前不要进 Phase 3。
 - **Verification**：navtest PDMS 落在 ckpt 文档声明值 ± 0.5 内；forward 后 frozen 参数（vlm.*）hash 不变。
 - **Pass criteria**：基线锁定 + frozen 参数 hash 校验通过。**记录这个数字 B0 作为后续 Phase 3/4 PDMS 目标的相对参照**：Phase 3 ≥ B0 − 1.2，Phase 4 ≥ B0 + 2.0。
+
+#### Task 0.4 — NAVSIM metric_cache 准备（**v2.5 新增，服务器必做**）
+
+> Phase 4 GRPO 训练每个 rollout 都要调用 PDMRewardWrapper.score(scene_token, trajectory)，scorer 内部读 `<METRIC_CACHE_ROOT>/<token>.lzma`。该 cache 是 NAVSIM 官方 metric pipeline 在 navtrain 上预跑得到的 PDM 评分中间产物。本机/服务器侧都尚未生成。
+
+- **Action**：
+  1. 在服务器侧 clone NAVSIM 官方仓库并装好 navsim env（与现有 `drivevla` env 共存，独立 conda env 以避免依赖冲突）：
+     ```bash
+     git clone https://github.com/autonomousvision/navsim.git
+     conda create -n navsim python=3.9 -y && conda activate navsim
+     pip install -e navsim/
+     ```
+  2. 按 NAVSIM README 的 `run_metric_caching` 流程，在 navtrain split 上预跑 PDM scorer：
+     ```bash
+     python navsim/planning/script/run_metric_caching.py \
+       split=trainval \
+       cache.cache_path=/path/to/metric_cache/trainval
+     ```
+     输出 `<METRIC_CACHE_ROOT>/<scene_token>.lzma`，每 token 包含 PDM 子项（NC/DAC/EP/TTC/C 的 sub-score）需要的中间状态。
+  3. 同样在 navtest split 上预跑（用于 Task 0.3 + Phase 3/4 mid-training eval）：
+     ```bash
+     python navsim/planning/script/run_metric_caching.py \
+       split=test \
+       cache.cache_path=/path/to/metric_cache/test
+     ```
+  4. 在 `utils/rl_modules/pdm_reward_wrapper.py` 里把 `<METRIC_CACHE_ROOT>` 暴露为构造参数（已实现），由 trainer arg `--metric_cache_root` 注入。
+  5. **smoke**：随机抽 100 个 navtrain scene_token，分别加载 `.lzma` 文件，调 `PDMRewardWrapper.score()` 跑通；同时与 navsim 官方 `pdm_score()` 单独对一遍，确认数值一致（容忍 1e-4）。
+- **Verification**：
+  - navtrain metric_cache 文件数 = scene_token 数（cache 完整）
+  - navtest metric_cache 同
+  - 100 个随机 sample 的 `PDMRewardWrapper.score()` 与 navsim 官方 reference 一致
+  - 一次 score 调用延迟 < 50ms（单 worker, 单 trajectory），用于 Task 4.2 throughput 估算
+- **Pass criteria**：完整 cache + 数值一致 + 延迟达标。
+- **失败兜底**：如果 NAVSIM env 装不上或 metric_cache 预跑失败超过 1 天，临时把 Phase 4 切到 `MockPDMRewardWrapper`（仅为打通流程），但 Task 4.4/4.5 PASS criteria 要等真实 metric_cache 就绪后重做。
 
 ---
 
@@ -357,39 +484,55 @@ $$R(\tau) = \begin{cases} -1 & \text{if collision} \\ NC \cdot DAC \cdot \frac{5
 > 若 ckpt 是完整 navtrain 训练（PDMS ≈ 87.2 级别）→ 走"adapt 模式"，2k steps 起步；
 > 若 ckpt 是 mini 数据中间产物（PDMS 远低于 87.2）→ 走"完整 IL warm-up 模式"，4k+ steps。
 
-> **v2.3 本机 mini smoke 模式（2026-05-10 新增）**：
-> 本仓库已确认 ckpt = 完整 navtrain 训练（PDMS 87.2 级别），按"adapt 模式"推进。
-> 但开发分两步走：
-> 1. **本机 mini smoke**（先跑通流程，单 5090，navsim mini 1192 scene，`normalizer_navsim_mini`）
-> 2. **服务器 full**（流程通过后转移，按本节原计划 2k–4k steps + 全 navtest 评估）
+> **v2.5 主路径（2026-05-12 切换为服务器全数据）**：
 >
-> 本机 mini smoke 模式相对原计划的关键差异：
-> - **步数**：`max_steps=300`，warmup 30 steps，`save_steps 100`，`eval_steps 50`
-> - **anchor warmup**：λ_a 与 σ_anchor 0→1 / 0→0.04 由 500 steps 等比缩到 **50 steps**（Task 3.2）
-> - **PASS 标准**：放弃 PDMS 绝对阈值，改为**纯工程性校验**——
+> Phase 3 主路径 = 服务器 8× A100 + navtrain full + `normalizer_navsim_trainval`，2000 起步 + early-stop 延至 4000 steps。本机 mini smoke 降级为 CI 通道（见 §0.5.4）。
+>
+> 服务器主路径关键参数：
+> - **步数**：`max_steps=2000`（B0 锁定后视情况延至 4000），warmup 100 steps，`save_steps=500`
+> - **有效 batch**：`per_device_train_batch_size=2 × NGPUS=8 × gradient_accumulation_steps=8 = 128`
+> - **anchor warmup**：λ_a 与 σ_anchor 0→1 / 0→0.04 over **500 steps**（v2.2 原值）
+> - **mid-training eval**：每 500 steps 跑一次 navtest 完整评测（高频监控 R9 anchor 冷启动退化）
+> - **PASS criteria**：navtest PDMS ≥ B0 − 1.2（v2.2 相对阈值）
+> - **K-Means anchor cache**：复用 `cache/anchor_centers_N20.npy`（已在全 navtrain 上 fit，迁移即用）
+> - **AR-WM lm_head**：按 Task 5.2 在 forward 时跳过 `lm_head` 与 `vlm_loss` 计算（A100 80GB 显存虽宽裕，但跳过 lm_head 是 R2 表示保护决策的一部分，与显存无关）
+> - **产物隔离**：`EXP_NAME=train_grpo_stage2a_full`，独立 output_dir（v2.4 mini ckpt 不进主路径）
+>
+> ---
+>
+> **v2.3 本机 mini CI 通道（保留作回归测试）**：
+> - 入口脚本：`scripts/scripts_train/train_grpo_stage2a_mini.sh` / `train_grpo_stage2a_mini_full_bce.sh`
+> - 配置：`max_steps=300`，warmup 30 steps，anchor warmup 50 steps，`normalizer_navsim_mini`，单 5090 32 GB
+> - 用途：trainer / model 代码改动的本机回归 smoke
+> - **不作 PASS criteria 信号**（v2.5 §0.5.4），但可保留以下工程性校验作 CI 通过条件：
 >   (i) forward+backward 无 NaN；
 >   (ii) trainable 参数计数符合预期；
 >   (iii) `vlm.*` 训练前后 hash 不变；
 >   (iv) loss 前 ~100 steps 单调下降趋势；
 >   (v) anchor warmup 期间 loss 不爆。
-> - **mini B0 跳过**：本机 navtest 评估方差过大，mini PDMS 不作 gating 信号；保留服务器 full 评估为唯一权威指标。
-> - **K-Means anchor cache**：复用已就绪的 `cache/anchor_centers_N20.npy`（Phase 1 Task 1.1 在全 navtrain 上算的），不在 mini 上重新 fit。
-> - **AR-WM lm_head**：本机显存吃紧，必须按 Task 5.2 在 forward 时跳过 `lm_head` 调用与 `vlm_loss` 计算（labels 传 None / wrapper 显式短路），不只是 freeze。
-> - **产物隔离**：`EXP_NAME=train_grpo_stage2a_mini`，独立 output_dir，不覆盖现 87.2 ckpt。
+> - **产物隔离**：mini 产物保留在 `logs/train_grpo_stage2a_mini*` 路径，不进 Phase 4 主路径。
 
-#### Task 3.1 — 训练脚本框架
-- **Action**：新建 `utils/train_grpo_stage2a.py`（沿用 `train_pi0.py` 的 HF Trainer + dataset 框架）+ 配套 `scripts/scripts_train/train_grpo_stage2a_mini.sh`（本机 mini smoke 入口）。**Trainable**：`action_expert.*` + `action_projector.*` + `action_decoder.*` + `tau_emb.*` + 新 `anchor_embedding.*` + `mixture_weight_head.*`。**Frozen**：`vlm.*`（含 lm_head，即 AR-WM 信号头）+ `state_projector.*` + tokenizer。**关键 flag**：`init_fresh_expert=False`（Plan §0.2 #7，必须走 `from_pretrained` 加载已训 expert，不要 fresh init）。
-- **Verification**：单 step forward+backward 通过；trainable param count = Task 0.2 实测值 + ~7M 新 heads；`vlm.*` 的 `.grad` 为 None。**v2.3 mini smoke 增项**：先实现 `--smoke_test` 模式（1 batch、1 step、不写 ckpt），通过后再启动 300-step 真训练。
-- **Pass criteria**：smoke test 通过 + 参数 hash 校验：vlm.* 训练前后不变。
+#### Task 3.1 — 训练脚本框架（v2.4 本机已交付 ✅；**v2.5 服务器主入口待启用**）
+- **Action**：新建 `utils/train_grpo_stage2a.py`（沿用 `train_pi0.py` 的 HF Trainer + dataset 框架）+ 配套：
+  - `scripts/scripts_train/train_grpo_stage2a_mini.sh`（v2.4 mini CI 通道，已交付）
+  - `scripts/scripts_train/train_grpo_stage2a_full.sh`（**v2.5 服务器主入口**，已交付占位脚本，需调 `NGPUS=8` 与 batch 参数）
+  
+  **Trainable**：`action_expert.*` + `action_projector.*` + `action_decoder.*` + `tau_emb.*` + 新 `anchor_embedding.*` + `mixture_weight_head.*`。**Frozen**：`vlm.*`（含 lm_head，即 AR-WM 信号头）+ `state_projector.*` + tokenizer。**关键 flag**：`init_fresh_expert=False`（Plan §0.2 #7，必须走 `from_pretrained` 加载已训 expert，不要 fresh init）。
+- **Verification**：单 step forward+backward 通过；trainable param count = Task 0.2 实测值 + ~7M 新 heads；`vlm.*` 的 `.grad` 为 None。`--smoke_test` 模式（1 batch、1 step、不写 ckpt），通过后再启动正式训练。
+- **Pass criteria**：
+  - **本机 CI**（已通过 ✅）：mini smoke 通过 + vlm.* hash 校验。
+  - **v2.5 服务器**：8 GPU DDP smoke 通过（NCCL 初始化 + DDP wrapper + grad sync 验证）+ trainable param count 与本机一致。
 
 #### Task 3.2 — 渐进式 Anchor 引入（R9 缓解）
 - **Action**：anchor_embedding 的输出乘以 warmup 系数 $\lambda_a$：
-  - 0 → 500 steps：$\lambda_a$ 线性 0→1（让 expert 起步沿用现 ckpt 行为）
-  - 500+ steps：$\lambda_a = 1$
-  - 同时 anchored path 的 σ_anchor 也做 0→0.04 线性 warmup
-  - **v2.3 本机 mini smoke**：warmup 步数等比缩到 50 steps（与 max_steps=300 匹配）
-- **Verification**：每 100 steps eval navtest PDMS（前 1k steps 高频）。**v2.3 mini smoke**：仅日志记录 λ_a / σ_anchor / loss 曲线，不评估 PDMS。
-- **Pass criteria**：训练全程 PDMS 不掉超过 max(2.0, B0 × 0.025)；最终回到 ≥ B0 − 1.2。**v2.3 mini smoke**：loss 曲线在 warmup 期内不爆（无 inf/nan，grad norm < 5.0）。
+  - **v2.5 服务器主路径**：0 → 500 steps：$\lambda_a$ 线性 0→1（让 expert 起步沿用现 ckpt 行为）；500+ steps：$\lambda_a = 1$；同时 anchored path 的 σ_anchor 也做 0→0.04 线性 warmup
+  - **v2.4 mini CI**：warmup 步数等比缩到 50 steps（与 max_steps=300 匹配，已交付 ✅）
+- **Verification**：
+  - **v2.5 服务器**：每 500 steps eval navtest PDMS（前 1k steps 切到每 200 steps 高频）
+  - **v2.4 mini CI**：仅日志记录 λ_a / σ_anchor / loss 曲线，不评估 PDMS
+- **Pass criteria**：
+  - **v2.5 服务器**：训练全程 PDMS 不掉超过 max(2.0, B0 × 0.025)；最终回到 ≥ B0 − 1.2
+  - **v2.4 mini CI**：loss 曲线在 warmup 期内不爆（无 inf/nan，grad norm < 5.0）
 
 #### Task 3.3 — IL Loss 实现（vs GT，仅正 anchor）
 - **Action**：组装
@@ -399,10 +542,16 @@ $$R(\tau) = \begin{cases} -1 & \text{if collision} \\ NC \cdot DAC \cdot \frac{5
 - **Verification**：初始 loss 数量级合理；前 100 steps 单调下降；用合成 batch（GT trajectory = 已知 anchor 中心 + 微噪声）验证 mixture_weight_head 能学出对应 anchor 高分。
 - **Pass criteria**：loss 收敛趋势 + mixture_weight 合成验证通过。
 
-#### Task 3.4 — 适配训练 + early-stop
-- **Action**：默认 2k steps；如果 1k 步时 PDMS 还未回到 B0 − 2.0，触发"延长模式"再加 2k；如果 4k 步仍未达到 B0 − 1.2，挂起进入 R10 兜底（Tier-1 LoRA 解冻 vlm 的 q/v_proj）。**v2.3 本机 mini smoke**：固定 `max_steps=300`，无 early-stop 分支（流程验证为目的，不追求收敛）；产物归档后转服务器跑原计划 2k 起步。
-- **Verification**：每 500 steps eval navtest，绘制曲线 + 关键 metric（NC/DAC/EP/TTC）。**v2.3 mini smoke**：跳过 navtest，仅看 loss 曲线 + grad norm + vlm hash 校验。
-- **Pass criteria**：`final navtest PDMS ≥ B0 − 1.2`（v2.2 把绝对 86.0 改为相对 B0 的相对值）。**v2.3 mini smoke**：5 项工程性校验全过（见 Phase 3 v2.3 修订段）。
+#### Task 3.4 — 适配训练 + early-stop（**v2.5 服务器主任务**）
+- **Action**：
+  - **v2.5 服务器**：默认 2k steps；如果 1k 步时 PDMS 还未回到 B0 − 2.0，触发"延长模式"再加 2k；如果 4k 步仍未达到 B0 − 1.2，挂起进入 R10 兜底（Tier-1 LoRA 解冻 vlm 的 q/v_proj）。
+  - **v2.4 mini CI**：固定 `max_steps=300`，无 early-stop 分支（流程验证为目的，不追求收敛），已通过 ✅
+- **Verification**：
+  - **v2.5 服务器**：每 500 steps eval navtest，绘制曲线 + 关键 metric（NC/DAC/EP/TTC）
+  - **v2.4 mini CI**：跳过 navtest，仅看 loss 曲线 + grad norm + vlm hash 校验
+- **Pass criteria**：
+  - **v2.5 服务器**：`final navtest PDMS ≥ B0 − 1.2`
+  - **v2.4 mini CI**：5 项工程性校验全过（见 §Phase 3 v2.4 mini CI 段，已通过 ✅）
 
 #### Task 3.5 — Stage 2-A ckpt 落盘（不再作 reference policy）
 - **Action**：保存最终 ckpt 作为 Stage 2-B 的初始化点。**v2.2 取消"reference policy KL 锚"用法**——DD-v2 实际代码 IL 项是 vs GT trajectory L1（[diffusiondrivev2_model_rl.py:1105](reference/DiffusionDriveV2/navsim/agents/diffusiondrivev2/diffusiondrivev2_model_rl.py#L1105)），无需第二份 frozen 副本。reference-policy KL 留给 Phase 7 ablation（Task 7.5 新增）。
@@ -438,33 +587,89 @@ $$R(\tau) = \begin{cases} -1 & \text{if collision} \\ NC \cdot DAC \cdot \frac{5
   - `utils/train_grpo_stage2b.py` — 新建（Pass-2 骨架）
   - `scripts/scripts_train/train_grpo_stage2b_mini.sh` — 新建（本机 4-step smoke）
   - `scripts/scripts_train/train_grpo_stage2b_full.sh` — 新建（服务器占位，含 TODO）
-- **Verification**：`bash scripts/scripts_train/train_grpo_stage2b_mini.sh` smoke_test 通过（形状 + finite + adv_std>0）；4-step 训练 loss=0、诊断日志正常。
-- **Pass criteria**：smoke 通过 + `compute_loss` 每 step 均打出 `rollout/reward_mean ∈ (0,1)`、`rollout/adv_std > 0`；vlm hash 一致。
+- **Verification（v2.4 本机 mini，已通过 ✅）**：`bash scripts/scripts_train/train_grpo_stage2b_mini.sh` smoke_test 通过（形状 + finite + adv_std>0）；4-step 训练 loss=0、诊断日志正常。
+- **Pass criteria（v2.4 本机 mini，已通过 ✅）**：smoke 通过 + `compute_loss` 每 step 均打出 `rollout/reward_mean ∈ (0,1)`、`rollout/adv_std > 0`；vlm hash 一致。
 
-#### Task 4.2 — 异步并行 Scorer
-- **Action**：multiprocessing pool（16 workers）异步评估 PDM。
-- **Verification**：throughput ≥ 200 trajectory/s；scorer 占比 < 30%。
-- **Pass criteria**：满足两项指标。
+> **v2.5 服务器侧子任务（Task 4.1-Server，新增）**：
+> 本机 mock smoke 仅验证形状/有限性。真实 reward 信号下的稳定性、PDMRewardWrapper async pool 集成、8 GPU DDP 下 rollout collector 的正确性都未验证。v2.5 必须补：
+> 1. **真实 scorer rollout smoke**：在服务器 `--use_mock_scorer False --metric_cache_root <REAL>` 模式下跑 `--smoke_test True`，验证：
+>    - `PDMRewardWrapper.score()` 对 batch B=2 个 navtrain scene_token 返回 reward ∈ [-1, 1]，与 navsim 官方 reference 一致；
+>    - sub_rewards (NC/DAC/EP/TTC/C) 全部 finite；
+>    - rollout/reward_mean 不再恒为 mock 的随机分布，反映真实 PDMS。
+> 2. **DDP 一致性**：8 GPU torchrun 下，各 rank 的 rollout RolloutBatch shape 完全一致（DDP allgather 时不会因 K=N_a×G 维度漂移崩）。
+> 3. **anchor_chunk=20 显存校验**：A100 80GB 下 anchor_chunk=20（即 N_anchor 全装）的 Pass-1 prefill 不 OOM（mini 本机 anchor_chunk=1 已通过，但服务器需要更大 chunk 提速）。
+>
+> - **Verification（v2.5 服务器）**：3 项 smoke 全过 + 单 step throughput < 60s（B=2, K=160, T=10, anchor_chunk=20）。
+> - **Pass criteria（v2.5 服务器）**：smoke 通过 + rollout/reward_mean 与 navtest baseline 量级一致（GT trajectory rollout 应 score ≥ 0.85）。
 
-#### Task 4.3 — GRPO Loss 集成（IL = vs GT L1，DD-v2 默认）
+#### Task 4.2 — 异步并行 Scorer（**v2.5 服务器首次集成**）
+- **Action**：`utils/rl_modules/pdm_reward_wrapper.py` 内部 `concurrent.futures.ProcessPoolExecutor(max_workers=16)`，异步评估 PDM；每个 worker 加载一份 navsim metric_cache lzma 解码状态，对 batched trajectory 批量 score。
+- **依赖**：Task 0.4 metric_cache 准备完成。
+- **服务器侧首次集成要点**：
+  1. ProcessPool worker 启动时不要继承 CUDA 上下文（spawn 而不是 fork），否则与 trainer 的 DDP NCCL 冲突；
+  2. 用 `multiprocessing.set_start_method('spawn', force=True)` 在 trainer 入口设置；
+  3. 每个 worker 内禁用 PyTorch CUDA（PDM scorer 纯 CPU），通过 `CUDA_VISIBLE_DEVICES=""` env 注入；
+  4. 队列长度限制 ≤ 2 × worker 数量，避免内存爆。
+- **Verification**：
+  - 单进程 baseline：1000 trajectory 串行 score 时间 T1
+  - 16-worker pool：1000 trajectory 异步 score 时间 T16
+  - 加速比 T1/T16 ≥ 10x
+  - throughput ≥ 200 trajectory/s
+  - GRPO 一个完整 step（包含 Pass-1 rollout + Pass-2 backward）中 scorer 占比 < 30%
+- **Pass criteria**：3 项指标全过；如果 scorer 占比 > 30%，把 worker 数升到 32 再测；仍不达标则把 PDM scorer 评测的 trajectory 数量降到 K=N_a×G=160 → K=80（G=4）作折衷。
+
+#### Task 4.3 — GRPO Loss 集成（IL = vs GT L1，DD-v2 默认）✅ v2.4 完成
 - **Action**：组装
   $$L = L_{RL} + \lambda_{IL} \cdot L_{IL,\text{vs-GT}}$$
   其中：
-  - $L_{RL}$ = REINFORCE per-token loss，按非零 token 平均（DD-v2 [model_rl.py:1096-1102](reference/DiffusionDriveV2/navsim/agents/diffusiondrivev2/diffusiondrivev2_model_rl.py#L1096-L1102)）
-  - $L_{IL,\text{vs-GT}}$ = 把 GT trajectory broadcast 到 `(B, N_anchor*G, T_decoder, ...)` 后做 (x,y) L1（DD-v2 [model_rl.py:1105-1112](reference/DiffusionDriveV2/navsim/agents/diffusiondrivev2/diffusiondrivev2_model_rl.py#L1105-L1112)）
+  - $L_{RL}$ = DD-v2 vanilla REINFORCE：`-mean(exp(lp_new - lp_new.detach()) * adv)`（ratio 始终 = 1，梯度 = $-A \nabla_\theta \log\pi_\theta$，[model_rl.py:1096](reference/DiffusionDriveV2/navsim/agents/diffusiondrivev2/diffusiondrivev2_model_rl.py#L1096)）
+  - $L_{IL,\text{vs-GT}}$ = per-step (x,y) L1 vs GT broadcast，[model_rl.py:1109-1112](reference/DiffusionDriveV2/navsim/agents/diffusiondrivev2/diffusiondrivev2_model_rl.py#L1109-L1112)
   - $\lambda_{IL} = 0.1$ if `has_positive` else 1.0（DD-v2 自适应权重）
-- **Verification**：loss 各项数值平衡；gradient norm < 1.0；初始几步 RL 项与 IL 项数量级在 1:10 ~ 10:1 之间。
-- **Pass criteria**：数值合理 + 梯度不爆炸。
+- **v2.4 实现关键决策**：
+  1. **RL loss 形式**：`exp(lp_new - lp_new.detach()) * adv`（ratio≡1，不是 `exp(lp_new - lp_old)`）。后者在 sigma_lp=0.10 + 物理坐标（~20m）下，任何 ~0.1m 速度扰动即 exp(lp_new-lp_old)→∞。IS 漂移监控仍通过 `ratio_diag = exp(lp_new.detach() - lp_old)` 打 wandb。
+  2. **Pass-2 batch size**：`B_eff = B*G`（与 Pass-1 collect_rollouts 相同），不是 B*1。bf16 + flash-attn 的浮点求和顺序依赖 batch size；即使每次处理同一锚点/组，B*G=1 vs B*G=2 会产生 ~0.1m 速度误差 → ratio 溢出。
+  3. **Pass-2 backward 粒度**：每 anchor × step = N_a × T = 80 次 backward call（B_eff=2 each），相比 per-sample（160 次，B_eff=1）减少一半但每次显存相似（checkpoint 存储 ~1 GB，backward 后释放）。`norm_denom = N_a * T`。
+  4. **新增 `predict_velocity_for_grpo`**（[modeling_emu3.py:2568-2665](reference/Emu3/emu3/mllm/modeling_emu3.py#L2568-L2665)）：单步 velocity 预测，精确复刻 `sample_actions_stochastic` 内层循环，但不做 stochastic Euler step，不加 `@no_grad`。
+  5. **`z_next_phys` 直存**（[stochastic_ode_sampler.py:stochastic_euler_step](models/policy_head/stochastic_ode_sampler.py)）：Pass-1 存储 pre-renormalize 物理坐标；bf16 round-trip `denorm(norm(x)) ≠ x`（~1e-3/dim × 16 dims = ~2 log_prob 误差）。
+- **Verification（v2.4 本地 `train_grpo_stage2b_mini.sh` 4-step + mock scorer，已通过 ✅）**：
+  - smoke: 6/6 checks PASSED，bit-identical ratio max_err = 0.000000 ✓
+  - step 0: loss/rl=0.35, loss/il=6.49, loss/total=6.84, ratio_mean(diag)=1.027 ✓
+  - step 1→4: grad_norm ∈ {684, 129, 376, 171}（均 finite，max_grad_norm=1.0 裁剪），loss/total 下降 6.84→6.77→6.61→6.40 ✓
+  - loss/il 稳定下降：6.49→6.42→6.26→6.05 ✓（IL 信号有效）
+  - VLMHashCallback: hash_match=True ✓（vlm.* 权重未变）
+- **Pass criteria（v2.4 本地，已通过 ✅）**：数值合理 + 梯度不爆炸。
 
-#### Task 4.4 — 1 Epoch Smoke Test
-- **Action**：1 epoch GRPO 训练。
-- **Verification**：navtest PDMS ≥ B0 − 1.2（与 Phase 3 一致或更高）。
-- **Pass criteria**：稳定性通过。
+> **v2.5 服务器侧子任务（Task 4.3-Server，新增）**：
+> 本机 4-step mock 仅验证 Pass-1/Pass-2 数值通路、IL 信号、grad 不爆炸。reward 是随机的，故 `loss/rl` 数值无意义；advantage 是随机的，REINFORCE gradient 方向也无意义。v2.5 必须在真实 PDM scorer 下补：
+> 1. **真实 reward 下的 RL 梯度方向**：在 100 个 navtrain scene 上跑 1 step，验证：
+>    - has_positive rate ∈ [0.3, 0.8]（不为 0，否则 λ_IL 永远 = 1.0；不为 1，否则 RL 信号过密）
+>    - 真实 advantage 分布：±std 量级 0.5-2.0
+>    - REINFORCE loss 方向：将 model output 朝高 reward anchor 拉，可通过 single-step IL+RL gradient cosine（与单跑 IL 的 gradient 比较）验证非反向
+> 2. **IS ratio 漂移**：单 step 后 ratio_diag.max() < 5.0（v2.4 §0.4.3 选择 vanilla ratio≡1 也要看 monitor 的 IS 漂移监控值；> 5 表示 σ_lp=0.10 仍不够）
+> 3. **多 step 持续稳定**：50 step 内 loss/rl 不偏离初始值 ±10x（验证 RL gradient 没有让 policy 漂移到 mock 测过的 reward 分布之外）
+>
+> - **Verification（v2.5 服务器）**：3 项稳定性 + reward_mean 在 50 step 内不下降（policy 至少没有变差）。
+> - **Pass criteria（v2.5 服务器）**：3 项达标 → Task 4.3 由"代码完成 ✅"升级为"真实数据下数值正确 ✅"。
 
-#### Task 4.5 — 完整 10 Epochs GRPO
-- **Action**：完整训练 + 每 epoch navtest + early stop（patience=2）。
-- **Verification**：曲线监控 + best ckpt 保存。
+#### Task 4.4 — 1 Epoch Smoke Test（**v2.5 服务器主任务**）
+- **Action**：1 epoch（~13,750 steps，per_device=2 × 8 GPU × accum=8 = eff_batch 128 / ~220k samples）GRPO 训练，全程 use_mock_scorer=False。
+- **Verification**：
+  - 全程无 NaN/Inf；grad_norm 全部 finite（clip 1.0 后）
+  - `loss/rl` 稳定（标准差 < 平均值的 5x）
+  - `rollout/reward_mean` 单调上升（或至少不下降）
+  - epoch 末 navtest PDMS 评估
+- **Pass criteria**：稳定性 4 项全过 + epoch 末 navtest PDMS ≥ B0 − 1.2（不要求超过 B0，但不能比 Phase 3 末显著退化）。
+- **v2.5 备注**：如果 1 epoch 末 PDMS < B0 − 2.0，先检查 (i) `metric_cache` 与 inference pipeline 的 PDM 计算是否一致；(ii) anchor warmup 在 Stage 2-A 是否已收敛；(iii) σ_step / G / T 调参是否过激。不要直接进 Task 4.5 烧 10 epoch。
+
+#### Task 4.5 — 完整 10 Epochs GRPO（**v2.5 服务器主训练**）
+- **Action**：完整 10 epoch 训练（~137,500 steps）+ 每 epoch 末 navtest + early stop（patience=2，监控 PDMS）；best ckpt 保留。
+- **资源预估（8× A100 80GB）**：
+  - 单 step（Pass-1 N_a=20×G=8 rollout + Pass-2 N_a×T=200 次 backward）≈ 60-120s（取决于 scorer worker pool throughput）
+  - 单 epoch ≈ 13,750 steps × 90s ≈ **14-17 小时**
+  - 10 epoch ≈ **6-7 天**
+- **Verification**：曲线监控（wandb：reward_mean / adv_std / loss_rl / loss_il / ratio_diag）+ best ckpt 保存。
 - **Pass criteria**：`final navtest PDMS ≥ B0 + 2.0`（v2.2 相对目标，复制 DD-v2 IL→GRPO 提升幅度，约 +3 PDMS 但留 1 PDMS 作 Mode Selector 之前的余量）。
+- **失败兜底**：如果 5 epoch 内 PDMS 没爬上 B0 + 1.0，启动 Phase 5 R10 兜底（Tier-1 LoRA）；同时启动 Task 5.1（σ_anchor grid search）。
 
 ---
 
@@ -681,20 +886,28 @@ DriveVLA-W0/                                    # 仓库根（已存在）
 
 ---
 
-## 5. 时间估算（v2.2 更新）
+## 5. 时间估算（v2.5 更新：以服务器主路径为基准）
 
-| Phase | Duration | Cumulative | 关键里程碑 |
-|-------|----------|-----------|-----------|
-| Task 0 (Ckpt 解析 + B0 复现) | 1 day | 1 day | trainer_state 摘要 + B0 锁定 |
-| Phase 1 | 3-5 days | 6 days | RL 模块单元测试全通；mode_selector 仅出骨架 |
-| Phase 2 | 5-7 days | 13 days | Anchored FM forward + zero-anchor 兼容性 + 物理空间噪声 unit tests |
-| Phase 3 | 2-4 days | 17 days | 适配 navtest PDMS ≥ B0 − 1.2（含 early-stop 延长机制） |
-| Phase 4 | 7-10 days | 27 days | GRPO PDMS ≥ B0 + 2.0 |
-| Phase 5 | 并行 | (-) | 8 项 risk 验证全过 |
-| Phase 6 | 5-6 days | 33 days | VLM-conditioned Selector 训完 + 新 anchored inference 脚本 + PDMS ≥ B0 + 3.0 |
-| Phase 7 | 3-5 days | 38 days | 评估 + 6 项 ablation + reference-KL ablation |
+> v2.5 时间估算改为"自服务器迁移开始日起"。Phase 1-2 视为已完成（本机交付），仅在 Day 0 留半天做服务器侧 sanity-rerun。
 
-**总计：约 5-6 周**（v2.2 比 v2.1 估的 4-5 周多 1 周——主要是 Phase 6 selector 重设计、Phase 7 ablation 增多、Task 0.3 真实 baseline 复现的开销）。
+| Phase | Duration | Cumulative | 关键里程碑 | v2.5 备注 |
+|-------|----------|-----------|-----------|---------|
+| Day 0 服务器迁移 | 0.5 day | 0.5 day | code/data/ckpt 同步 + env 验证 | §10 检查清单 |
+| Task 0.1-0.3 (B0 复现) | 1 day | 1.5 day | B0 锁定 | 阻塞 Phase 3 |
+| **Task 0.4 (metric_cache)** | **1-3 days** | **2.5-4.5 day** | **navtrain + navtest cache 就绪** | **v2.5 新增** |
+| Phase 1 (sanity-rerun) | 0.5 day | (并行) | 70 tests 全过 | 本机已完成 |
+| Phase 2 (sanity-rerun) | 0.5 day | (并行) | unit tests + smoke 全过 | 本机已完成 |
+| Phase 3 (Stage 2-A IL 全数据) | 2-4 days | 5-9 day | navtest PDMS ≥ B0 − 1.2 | **服务器重跑** |
+| Phase 4 Task 4.1-4.3 server smoke | 1-2 days | 6-11 day | 真实 scorer 下数值通过 | **服务器首次** |
+| Phase 4 Task 4.4 (1 epoch) | 1 day | 7-12 day | 1-epoch 稳定性 + PDMS ≥ B0 − 1.2 | **服务器首次** |
+| Phase 4 Task 4.5 (10 epoch) | **6-7 days** | 13-19 day | PDMS ≥ B0 + 2.0 | **服务器主训** |
+| Phase 5 (Risks) | 并行 | (-) | 8 项 risk 验证全过 | 与 Phase 4 并行 |
+| Phase 6 (Mode Selector) | 5-6 days | 18-25 day | PDMS ≥ B0 + 3.0 | 服务器全做 |
+| Phase 7 (评估 + ablation) | 3-5 days | 21-30 day | 完整 table | 服务器全做 |
+
+**v2.5 服务器侧总计：约 3-4.5 周**（不含本机已完成的 Phase 1-2，~13 天）。比 v2.2 的 5-6 周估算少 ~2 周，原因：Phase 1-2 本机已交付，迁移即用。
+
+**关键阻塞链**：Task 0.3 + 0.4 是 Phase 3/4 的前置依赖；如果 metric_cache 准备失败 ≥ 3 天，需启动 mock scorer + 后期补真实评测的 fallback 方案。
 
 ---
 
@@ -706,7 +919,8 @@ DriveVLA-W0/                                    # 仓库根（已存在）
 | steps | 2k 起步 + early-stop 延至 4k | 视 Task 0.3 实测 B0 决定 |
 | anchor 系数 $\lambda_a$ warmup | 0→1 over 500 steps | R9 缓解 |
 | anchor σ_anchor warmup | 0→0.04 over 500 steps | v2.2 新增；与 λ_a 同步 |
-| batch size | 512 | DD-v2 |
+| effective batch (v2.5 服务器) | **128** (per_device=2 × NGPUS=8 × accum=8) | v2.5；A100 80GB 显存兜底 |
+| effective batch (DD-v2 原值) | 512 | 仅供对照；GRPO Pass-2 显存超限 |
 | Action Expert LR | 2e-4 | DD-v2 |
 | 新 heads LR multiplier | 1.0 | 与 expert 同步 |
 | `vlm.*` | 完全 frozen（含 lm_head） | v2.2 关键 |
@@ -714,6 +928,8 @@ DriveVLA-W0/                                    # 仓库根（已存在）
 | weight decay | 1e-4 | DD-v2 |
 | **Phase 4 GRPO** | | |
 | epochs | 10 | DD-v2 |
+| effective batch (v2.5 服务器) | **128** (per_device=2 × NGPUS=8 × accum=8) | v2.5；与 Phase 3 一致 |
+| anchor_chunk | **20**（v2.5 服务器，全装） | A100 80GB 单卡装 N_anchor=20 Pass-1 prefill |
 | N_anchor | **20**（10/15/20 grid） | v2.2 与 DD-v2 默认对齐 |
 | G per anchor | 8 | DD-v2 默认 10 → v2.2 取 8 节省 scorer |
 | T_trunc (训练 denoising 步数) | 10 | DD-v2 |
@@ -740,18 +956,23 @@ DriveVLA-W0/                                    # 仓库根（已存在）
 
 ---
 
-## 7. 验收标准（v2.2 最终）
+## 7. 验收标准（v2.5 服务器主路径）
 
-> 所有 PDMS 阈值改为相对 Task 0.3 实测的 B0，避免对 87.2 的硬绑定。
+> 所有 PDMS 阈值改为相对 Task 0.3 实测的 B0，避免对 87.2 的硬绑定。**所有 PDMS 数值必须基于服务器侧 navtest 评测，本机 mini/mock 不作 gating。**
 
-- [ ] Task 0.1-0.3：trainer_state 摘要 + ckpt 干净加载（实际 prefix）+ navtest 复现到 ckpt 文档声明值 ± 0.5（B0 锁定）+ 物理 vs 归一化空间转换函数 unit test
-- [ ] Phase 1：所有 RL 模块单元测试通过
-- [ ] Phase 2：Anchored FM forward + zero-anchor 兼容性 + 6 个 unit tests（anchor_emb / anchored_path / mixture_head / sampler / log_pi / e2e_smoke）
-- [ ] Phase 3：navtest PDMS ≥ B0 − 1.2（允许 anchor 结构引入小幅退化）
-- [ ] Phase 4：navtest PDMS ≥ B0 + 2.0（复制 DD-v2 IL→GRPO 改善幅度）
+- [x] **Phase 1（本机已交付 ✅）**：所有 RL 模块单元测试通过；Phase 2 同
+- [x] **Phase 2（本机已交付 ✅）**：Anchored FM forward + zero-anchor 兼容性 + 7 个 unit tests（anchor_emb / anchored_path / mixture_head / sampler / log_pi / multiplicative_noise / e2e_smoke）
+- [ ] **Day 0 v2.5 迁移**：§10 检查清单全过
+- [ ] Task 0.1-0.3：服务器侧 sanity rerun + navtest 复现到 ckpt 文档声明值 ± 0.5（**B0 锁定，写入 §0.4**）
+- [ ] **Task 0.4（v2.5 新增）**：NAVSIM metric_cache 准备就绪（navtrain + navtest）+ 100 sample 数值对齐 navsim 官方
+- [ ] Phase 3：服务器侧重跑 Stage 2-A IL 适配；navtest PDMS ≥ B0 − 1.2（允许 anchor 结构引入小幅退化）
+- [ ] **Task 4.1-Server / 4.2**：真实 PDMRewardWrapper smoke + 16-worker async pool throughput ≥ 200 traj/s
+- [ ] Task 4.3-Server：真实 reward 下 RL gradient 方向正确 + IS ratio 漂移 < 5.0
+- [ ] Task 4.4：1-epoch smoke navtest PDMS ≥ B0 − 1.2
+- [ ] Task 4.5：navtest PDMS ≥ B0 + 2.0（复制 DD-v2 IL→GRPO 改善幅度）
 - [ ] Phase 5：8 项活跃 risk 全部缓解验证（含 R11 baseline 真实性、R12 cmd/anchor 关系）
 - [ ] Phase 6：完整 pipeline navtest PDMS ≥ B0 + 3.0
-- [ ] Phase 7：完整 ablation table（含 v2.2 新增 (e) cmd/anchor、(f) N_anchor grid、Task 7.5 reference-policy KL）+ Top-K PDMS 报告
+- [ ] Phase 7：完整 ablation table（含 v2.2 新增 (e) cmd/anchor、(f) N_anchor grid、(g) 噪声施加空间、Task 7.5 reference-policy KL）+ Top-K PDMS 报告
 
 ---
 
@@ -781,15 +1002,102 @@ DriveVLA-W0/                                    # 仓库根（已存在）
 
 ---
 
-## 9. 开发先后顺序（v2.2 落地建议）
+## 9. 开发先后顺序（v2.5 服务器主路径）
 
-按依赖链建议的执行顺序：
+> v2.2 原顺序按"Day 0 → Phase 1 → Phase 2 → ..."从零开始。v2.5 起 Phase 1-2 已在本机交付，服务器侧顺序重排为：
 
-1. **Day 0**（必须先做）：Task 0.1-0.3。这一步决定 B0 与后续阈值。如果 B0 < 80，**先暂停后续开发**，跑完整 IL warm-up（直接复用 `train_pi0.py` + 完整 navtrain，目标到达 ≥ 85）后再回到 GRPO 主路径。
-2. **Phase 1（解耦）**：Task 1.1-1.7 全是纯算法/工具模块，与 ckpt 解耦，单元测试驱动，可与 Phase 2 并行。
-3. **Phase 2（核心改造）**：Task 2.1 → 2.3 → 2.2 → 2.4 → 2.5 → 2.6 顺序推荐——先把 anchored path（不动模型）做好，再注入 anchor token，最后做 sampler+log_pi。
-4. **Phase 3（IL adapt）**：先 Task 3.2 的 λ_a warmup 必须真实跑通，再进 Task 3.4。
-5. **Phase 4（GRPO main）**：在 Phase 3 ckpt 之上展开。
-6. **Phase 5（risk）**：与 Phase 4 并行；R11/R12 在 Phase 0/3 阶段就要做，不要拖到 Phase 5 末尾。
-7. **Phase 6（Mode Selector）**：Phase 4 的最优 ckpt 出来后才能开始（依赖 rollout 数据）。
-8. **Phase 7（评估 + ablation）**：所有训练完成后。
+1. **Day 0 上半（必须先做）**：服务器迁移 (§10 检查清单)
+   - code / pretrained_models / cache / configs 同步
+   - drivevla conda env 装好（按 `memory/project_drivevla_env.md`：torch 2.7.0+cu128，flash-attn 源码构建）
+   - dataset (navtrain pkl + navtest pkl) 路径验证
+   
+2. **Day 0 下半**：Task 0.1-0.3（B0 复现）+ 本机 unit tests sanity-rerun
+   - Task 0.1：ckpt 解析复跑，与本机 `trainer_state.json` 摘要对齐
+   - Task 0.2：组件加载 + 多 GPU DDP wrapper 验证
+   - Task 0.3：navtest baseline → B0 锁定（**阻塞后续 phase**）
+   - 同时：`pytest tests/` 全过（验证 Phase 1-2 模块迁移正确）
+   
+3. **Day 1-3**：Task 0.4 metric_cache 准备（**v2.5 新增前置**）
+   - navtrain split metric_cache（Phase 4 必需）
+   - navtest split metric_cache（Phase 3 mid-eval + Task 4.4/4.5 epoch-end eval）
+   - 100 sample 数值对齐 navsim 官方
+   
+4. **Day 3-9**：Phase 3 Stage 2-A 全数据 IL 适配
+   - Task 3.1 服务器入口：`train_grpo_stage2a_full.sh`（NGPUS=8, eff_batch=128）
+   - Task 3.2 anchor warmup 500 steps（v2.2 原参数）
+   - Task 3.4 主训 2k 起步 + 每 500 steps navtest eval
+   - 出 Phase 3 ckpt
+   
+5. **Day 9-12**：Phase 4 server smoke
+   - Task 4.1-Server：真实 PDMRewardWrapper smoke + 8 GPU DDP rollout 验证
+   - Task 4.2：async scorer pool 集成 + throughput 验证（≥ 200 traj/s）
+   - Task 4.3-Server：1-step 真实 reward 下的 RL 梯度方向验证
+   - Task 4.4：1-epoch smoke + epoch-末 navtest
+   
+6. **Day 12-19**：Task 4.5 完整 10-epoch GRPO 主训
+   - 每 epoch 末 navtest + early stop（patience=2）
+   - 同时 Phase 5 R1/R5.5 并行（σ 调参、log-π 数值稳定监控）
+   - 最优 ckpt 标记
+   
+7. **Day 19-25**：Phase 6 Mode Selector
+   - Task 6.1 设计 + 6.2 rollout 数据生成（需 Phase 4 最优 ckpt）
+   - Task 6.3 训练 + 6.4 新 anchored inference 脚本
+   
+8. **Day 25-30**：Phase 7 评估 + 消融
+   - NAVSIM v1 完整 PDMS + 子项
+   - 7 项 ablation（含 v2.2/v2.5 新增）
+   
+**关键阻塞链**：Task 0.3 → Phase 3；Task 0.4 → Task 4.2 → Task 4.4 → Task 4.5 → Phase 6/7。**Task 0.4 失败 ≥ 3 天**则启动 fallback：用 mock scorer + 后期补真实评测。
+
+---
+
+## 10. v2.5 服务器迁移检查清单（Day 0 必跑）
+
+> 在启动任何 phase 之前，**先逐项打勾**确认服务器侧准备完毕。每项失败立即修复，不要带病推进。
+
+### 10.1 代码 / 环境
+
+- [ ] git 仓库同步到服务器（branch=`wang` 或目标 branch）
+- [ ] `conda create -n drivevla python=3.10`（或参考 `memory/project_drivevla_env.md` 实际版本）
+- [ ] **PyTorch**：`torch==2.7.0+cu128`（A100 用 cu121 也行，需重测 flash-attn）
+- [ ] **flash-attn**：源码编译（CXX11 ABI 一致，参考 memory）；`python -c "import flash_attn; print(flash_attn.__version__)"`
+- [ ] 其他依赖：`transformers / accelerate / safetensors / pillow / wandb`（用 `pip install -r requirements.txt` 如有，否则按 `train_grpo_stage2a.py` 顶部 import 一一装）
+- [ ] **NAVSIM env（独立 conda env）**：用于 Task 0.4 metric_cache + 后续 navtest eval
+- [ ] `PYTHONPATH=$(pwd)` 与 `VLA_NORM_STATS=$(pwd)/configs/normalizer_navsim_trainval/norm_stats.json` 正确（参考现 `train_grpo_stage2a_full.sh`）
+- [ ] wandb 登录（API key 从 memory 或 .env，注意不要把 key commit）
+
+### 10.2 数据 / 模型
+
+- [ ] `pretrained_models/Emu3_Flow_Matching_Action_Expert_PDMS_87.2/` 完整（4 个 safetensor shard + config + tokenizer）
+- [ ] `cache/anchor_centers_N20.npy` 从本机同步过来（**不要在服务器重 fit**，本机版已在全 navtrain 上跑过）
+- [ ] `configs/normalizer_navsim_trainval/` 完整（含 `norm_stats.json`）
+- [ ] `configs/normalizer_navsim_mini/` 可选（仅 CI 通道用）
+- [ ] navtrain pkl：`/path/to/navsim/processed_data/meta/navsim_emu_vla_256_144_trainval_pre_1s.pkl`
+- [ ] navtest pkl：同上目录的 test split
+- [ ] 原始 navsim raw data（sensor frames）路径就绪（推理 + metric_caching 都要读）
+- [ ] **metric_cache**（Task 0.4）：navtrain + navtest 两个 split
+
+### 10.3 多 GPU / DDP 配置
+
+- [ ] 确认 `nvidia-smi` 显示 8× A100 80GB 在位
+- [ ] NCCL env：`NCCL_DEBUG=WARN`、`NCCL_IB_DISABLE=0`（如有 IB）；`NCCL_P2P_LEVEL=NVL`
+- [ ] `torchrun --nproc_per_node=8 --nnodes=1 ...` 单机配置（多机暂不考虑）
+- [ ] `scripts/scripts_train/train_grpo_stage2a_full.sh` 内 `NGPUS=8`（当前是 1，必须改）
+- [ ] `scripts/scripts_train/train_grpo_stage2b_full.sh` 内 `NGPUS=8`（同上）
+- [ ] effective batch 检查：per_device=2 × NGPUS=8 × grad_accum=8 = **128**（与 §0.5.3 一致）
+
+### 10.4 路径 TODO 兜底
+
+- [ ] `train_grpo_stage2b_full.sh` 内 `INIT_CKPT_PATH` 改为服务器侧 Phase 3 出的真实 ckpt（先占位为 `logs/train_grpo_stage2a_full/checkpoint-2000`，Phase 3 跑完后回写实际 best step）
+- [ ] `METRIC_CACHE_ROOT` 改为 Task 0.4 实际输出路径（替换 `/TODO/navsim/metric_cache/trainval`）
+- [ ] `DATAPATH` 在两个脚本里都核对（trainval pkl 路径）
+
+### 10.5 sanity-rerun（迁移完成的判定）
+
+- [ ] `pytest tests/`：70 tests 全过（迁移正确）
+- [ ] `bash scripts/scripts_train/train_grpo_stage2a_mini.sh`：mini smoke 跑通（不强求 PDMS，仅看 loss finite）
+- [ ] Task 0.1-0.2：ckpt 加载 + 多 GPU DDP wrapper 验证
+- [ ] Task 0.3：navtest baseline → **B0 写入 wandb run name / 实验日志**
+- [ ] 文档同步：把 B0 实测值写回 §0.4 IL baseline 段落与 §7 验收标准的相对阈值（如 B0=84.5 → Phase 3 阈值 83.3 / Phase 4 阈值 86.5 / Phase 6 阈值 87.5）
+
+---

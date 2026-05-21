@@ -210,8 +210,6 @@ class GRPOStage2BTrainer(tf.Trainer):
         cmd            = inputs["cmd"].to(device, dtype=dtype)
 
         anchor_norm_d  = self._anchors_norm.to(device, dtype=dtype)
-        anchor_chunk   = self._s2b_args.anchor_chunk
-        n_chunks       = (N_a + anchor_chunk - 1) // anchor_chunk
 
         gt_xy = rb.gt_trajectory[..., :2]   # (B, N_F, 2) physical, detached
 
@@ -223,19 +221,22 @@ class GRPOStage2BTrainer(tf.Trainer):
             torch.ones_like(has_positive, dtype=dtype),
         ).mean().item()   # float
 
-        # Per-sample serial forward+backward (B*K_c = B per call) to keep
-        # gradient-checkpointing boundary tensors small enough to fit. Going
-        # from B*K_c=2 → B*K_c=1 cuts VLM FFN peak from 66 MB to ~22 MB and
-        # checkpoint-input storage from 644 MB to 161 MB, leaving room within
-        # the <2 GB headroom on a 32 GB GPU. Each sample's loss is normalized
-        # by (K*T) so the accumulated gradient matches the original mean.
+        # Per-anchor serial forward+backward: each call uses B_eff = B*G samples
+        # (same batch size as Pass-1 collect_rollouts), which is critical for
+        # bit-identical velocities. In bfloat16, flash-attention accumulates
+        # floats in batch-size-dependent order; even a ~0.1 m velocity error
+        # causes exp(lp_new - lp_old) overflow when sigma_lp=0.10 and physical
+        # waypoints are 10-50 m (giving lp_old ≈ -(diff²/0.02)×16 dims ≈ -500).
+        # The per-anchor batch of G=2 still fits within the 9.6 GB headroom on
+        # a 32 GB GPU (checkpoint-input storage ≈ 1 GB per call; freed on backward).
         total_rl = 0.0
         total_il = 0.0
         total_ratio_sum = 0.0
         total_ratio_max = -float("inf")
-        n_samples_seen = 0
-        K_total = N_a * G
-        norm_denom = float(K_total * T)   # mean over (K, T); B handled by .mean() within rl/il
+        n_iters = 0
+        norm_denom = float(N_a * T)   # N_a * T backward calls; each call's mean covers B*G
+
+        gt_xy = gt_xy.repeat_interleave(G, dim=0)   # (B*G, N_F, 2) physical
 
         for t_idx in range(T):
             t_value = 1.0 + t_idx * dt   # matches Pass-1 current_time at step t_idx
@@ -243,55 +244,72 @@ class GRPOStage2BTrainer(tf.Trainer):
             adv_t       = rb.advantages[:, :, t_idx].detach()  # (B, K)
 
             for n in range(N_a):
-                anc_one = anchor_norm_d[n:n+1]                       # (1, N_F, 3)
-                for g in range(G):
-                    k = n * G + g
+                k0, k1 = n * G, (n + 1) * G
 
-                    # Single-sample tile: B*K_c = B*1 = B  (mini: B=1)
-                    anc_bk = anc_one.expand(B, -1, -1, -1).reshape(B, N_F, 3)
-                    z_t_bk    = rb.z_t_per_step[:, k, t_idx]            # (B, N_F, 3)
-                    z_next_bk = rb.z_next_phys_per_step[:, k, t_idx]    # (B, N_F, 3)
+                # Tile anchor+VLM inputs to B*G — mirrors Pass-1 repeat_interleave pattern
+                anc_beff = (
+                    anchor_norm_d[n:n+1]
+                    .unsqueeze(1).expand(-1, G, -1, -1)   # (1, G, N_F, 3)
+                    .reshape(G, N_F, 3)
+                    .unsqueeze(0).expand(B, -1, -1, -1)   # (B, G, N_F, 3)
+                    .reshape(B * G, N_F, 3)               # (B*G, N_F, 3)
+                )
+                ids_beff  = input_ids.repeat_interleave(G, dim=0) if input_ids is not None else None
+                mask_beff = attention_mask.repeat_interleave(G, dim=0) if attention_mask is not None else None
+                pa_beff   = pre_action.repeat_interleave(G, dim=0)
+                cmd_beff  = cmd.repeat_interleave(G, dim=0)
 
-                    velo_pred = model.predict_velocity_for_grpo(
-                        input_ids=input_ids,
-                        pre_action=pre_action,
-                        cmd=cmd,
-                        z_t=z_t_bk,
-                        t_value=t_value,
-                        anchor=anc_bk,
-                        attention_mask=attention_mask,
-                    )   # (B, N_F, 3) with grad
+                z_t_beff   = rb.z_t_per_step[:, k0:k1, t_idx].reshape(B * G, N_F, 3)
+                z_next_beff= rb.z_next_phys_per_step[:, k0:k1, t_idx].reshape(B * G, N_F, 3)
+                lp_old_beff= log_p_old_t[:, k0:k1].reshape(B * G)   # (B*G,)
+                adv_beff   = adv_t[:, k0:k1].reshape(B * G)          # (B*G,)
 
-                    lp_k = recompute_log_prob(
-                        z_t_norm=z_t_bk,
-                        velo_pred=velo_pred,
-                        z_next_phys_stored=z_next_bk,
-                        dt=dt,
-                        q01=q01,
-                        q99=q99,
-                        sigma_step=self._s2b_args.sigma_step,
-                        sigma_logprob_min=self._s2b_args.sigma_logprob_min,
-                    )   # (B,)
+                velo_pred = model.predict_velocity_for_grpo(
+                    input_ids=ids_beff,
+                    pre_action=pa_beff,
+                    cmd=cmd_beff,
+                    z_t=z_t_beff,
+                    t_value=t_value,
+                    anchor=anc_beff,
+                    attention_mask=mask_beff,
+                )   # (B*G, N_F, 3) with grad
 
-                    z_mean_phys_k = denormalize(z_t_bk + dt * velo_pred, q01, q99)   # (B, N_F, 3)
+                lp_new = recompute_log_prob(
+                    z_t_norm=z_t_beff,
+                    velo_pred=velo_pred,
+                    z_next_phys_stored=z_next_beff,
+                    dt=dt,
+                    q01=q01,
+                    q99=q99,
+                    sigma_step=self._s2b_args.sigma_step,
+                    sigma_logprob_min=self._s2b_args.sigma_logprob_min,
+                )   # (B*G,)
 
-                    ratio_k = torch.exp(lp_k - log_p_old_t[:, k])   # (B,)
-                    rl_k    = -(ratio_k * adv_t[:, k]).mean()        # scalar (mean over B)
-                    il_k    = F.l1_loss(z_mean_phys_k[..., :2], gt_xy, reduction="mean")  # scalar
+                z_mean_phys = denormalize(z_t_beff + dt * velo_pred, q01, q99)  # (B*G, N_F, 3)
 
-                    # 1/(K*T) so the sum across all samples equals mean over (B, K, T).
-                    loss_k = (rl_k + lambda_il_val * il_k) / norm_denom
-                    loss_k.backward()   # accumulate grad, free this sample's graph
+                # DD-v2 vanilla REINFORCE: exp(lp_new - lp_new.detach()) == 1 always;
+                # gradient flows through lp_new → ∇_θ log_π(a|s) × A.
+                # No IS explosion after parameter updates (unlike exp(lp_new - lp_old)).
+                ratio = torch.exp(lp_new - lp_new.detach())        # (B*G,), always 1.0
+                rl    = -(ratio * adv_beff).mean()                  # scalar
+                il    = F.l1_loss(z_mean_phys[..., :2], gt_xy, reduction="mean")
 
-                    total_rl        += rl_k.detach().item()
-                    total_il        += il_k.detach().item()
-                    total_ratio_sum += ratio_k.detach().mean().item()
-                    total_ratio_max  = max(total_ratio_max, ratio_k.detach().max().item())
-                    n_samples_seen  += 1
+                loss_n = (rl + lambda_il_val * il) / norm_denom
+                loss_n.backward()   # accumulate grad, free this anchor's graph
 
-        total_rl         /= n_samples_seen
-        total_il         /= n_samples_seen
-        total_ratio_mean  = total_ratio_sum / n_samples_seen
+                # Log IS-ratio diagnostic (exp(lp_new - lp_old)) after backward;
+                # ratio_diag monitors policy drift without affecting the gradient.
+                with torch.no_grad():
+                    ratio_diag = torch.exp(lp_new - lp_old_beff)   # (B*G,)
+                total_rl        += rl.detach().item()
+                total_il        += il.detach().item()
+                total_ratio_sum += ratio_diag.mean().item()
+                total_ratio_max  = max(total_ratio_max, ratio_diag.max().item())
+                n_iters         += 1
+
+        total_rl         /= n_iters
+        total_il         /= n_iters
+        total_ratio_mean  = total_ratio_sum / n_iters
         total_loss_val    = total_rl + lambda_il_val * total_il
 
         # ── Logging ──────────────────────────────────────────────────────
